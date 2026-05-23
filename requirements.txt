@@ -1,0 +1,9 @@
+# Core — serial port monitoring and GUI log viewer
+pyserial>=3.5
+
+# verify.py — CoAP/OSCORE smoke tests
+aiocoap[oscore,tinydtls]>=0.4.7
+cbor2>=5.4
+
+# verify.py --check-influx (optional)
+# influxdb-client[async]>=1.36

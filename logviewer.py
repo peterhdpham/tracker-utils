@@ -4,12 +4,13 @@ logviewer.py — tracker project dev console.
 
 Features:
   • 3-panel log viewer: BLE (if00), LTE (if02), Thingy:53 RTT
-  • Auto-spawns JLinkGDBServer for Thingy:53 RTT
-  • Per-device: Reset, Build, Build Pristine, Flash
+  • Auto-spawns JLinkGDBServer for Thingy:53 RTT (logs its output to Thingy53 panel)
+  • Thingy:91X: common Reset + separate Build/Flash for LTE and BLE
+  • Thingy:53:  Reset + Build / Build Pristine / Flash
   • CSV recording, clipboard copy
 
 Usage:
-    python3 scripts/logviewer.py
+    python3 tracker-utils/logviewer.py        # from tracker_project/ or tracker-utils/
 
 Dependencies:
     pip install pyserial
@@ -18,7 +19,6 @@ Dependencies:
 import argparse
 import csv
 import glob
-import os
 import queue
 import re
 import shutil
@@ -33,11 +33,21 @@ from tkinter import filedialog, scrolledtext, ttk
 
 import serial
 
-# ── Paths ───────────────────────────────────────────────────────────────────────
+# ── Workspace paths ─────────────────────────────────────────────────────────────
+#
+# Matches the WORKSPACE variable in ble.sh / lte.sh / sensor.sh:
+#   WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Since this script lives at tracker_project/tracker-utils/, parent = tracker_project/.
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent
-_HUB_DIR     = _SCRIPTS_DIR.parent / "tracker-hub"
-_SENSOR_DIR  = _SCRIPTS_DIR.parent / "tracker-sensor-node"
+_HERE      = Path(__file__).resolve().parent   # tracker_project/tracker-utils/
+_WORKSPACE = _HERE.parent                      # tracker_project/
+
+# ── NCS toolchain version ────────────────────────────────────────────────────────
+NCS_VERSION = "v3.1.1"
+NRFUTIL_WRAP = [
+    "nrfutil", "sdk-manager", "toolchain", "launch",
+    "--ncs-version", NCS_VERSION, "--",
+]
 
 # ── J-Link server definitions ───────────────────────────────────────────────────
 
@@ -49,7 +59,7 @@ JLINK_SERVERS = [
         "gdb_port": 2331,
         "rtt_port": 19021,
     },
-    # Uncomment for hub-ble RTT (needs CONFIG_LOG_BACKEND_RTT=y in hub-ble prj.conf)
+    # Uncomment for hub-ble RTT (needs CONFIG_LOG_BACKEND_RTT=y in hub-ble prj.conf):
     # {
     #     "label":    "BLE",
     #     "device":   "nRF5340_XXAA_APP",
@@ -59,42 +69,90 @@ JLINK_SERVERS = [
     # },
 ]
 
-# ── Device action definitions ───────────────────────────────────────────────────
+# ── Reset groups (shared reset button for devices on the same DK) ───────────────
+
+RESET_GROUPS = {
+    "91X": {"label": "Thingy:91X", "snr": "1051217937", "panels": ["BLE", "LTE"]},
+    "53":  {"label": "Thingy:53",  "snr": "1050337728", "panels": ["Thingy53"]},
+}
+
+# ── Per-target build / flash definitions ────────────────────────────────────────
 #
-# build_cmd / flash_cmd are the bare west subcommand args.
-# They are automatically wrapped with nrfutil sdk-manager toolchain launch.
+# build_cmd / flash_cmd are bare west args — wrapped with NRFUTIL_WRAP at runtime.
+# pre_flash_cmds (optional): raw commands run WITHOUT nrfutil wrap before flash.
+# Matches ble.sh / lte.sh / sensor.sh exactly.
 
-NRFUTIL_WRAP = [
-    "nrfutil", "sdk-manager", "toolchain", "launch",
-    "--ncs-version", "v3.1.0", "--",
-]
+_LTE_APP   = _WORKSPACE / "tracker-hub" / "apps" / "tracker-hub-lte"
+_BLE_APP   = _WORKSPACE / "tracker-hub" / "apps" / "tracker-hub-ble"
+_SENS_APP  = _WORKSPACE / "tracker-sensor-node" / "tracker-node"
+_LTE_BLD   = _WORKSPACE / "build" / "lte"
+_BLE_BLD   = _WORKSPACE / "build" / "ble"
+_SENS_BLD  = _WORKSPACE / "build" / "sensor"
 
-DEVICES = {
-    "91X": {
-        "label":     "Thingy:91X",
-        "panels":    ["BLE", "LTE"],
-        "snr":       "1051217937",
-        "cwd":       str(_HUB_DIR),
+TARGETS = {
+    "lte": {
+        "label":   "LTE",
+        "panels":  ["LTE"],
+        "snr":     "1051217937",
+        "cwd":     str(_WORKSPACE),
         "build_cmd": [
             "west", "build",
             "-b", "thingy91x/nrf9151/ns",
-            "apps/tracker-hub-lte",
+            "--build-dir", str(_LTE_BLD),
+            str(_LTE_APP),
+            "--sysbuild",
+            "--", f"-DEXTRA_CONF_FILE={_LTE_APP}/local.conf",
+        ],
+        "flash_cmd": [
+            "west", "flash",
+            "--recover",
+            "--build-dir", str(_LTE_BLD),
+            "--snr", "1051217937",
+        ],
+    },
+    "ble": {
+        "label":   "BLE",
+        "panels":  ["BLE"],
+        "snr":     "1051217937",
+        "cwd":     str(_WORKSPACE),
+        "build_cmd": [
+            "west", "build",
+            "-b", "thingy91x/nrf5340/cpuapp",
+            "--build-dir", str(_BLE_BLD),
+            str(_BLE_APP),
             "--", "-DEXTRA_CONF_FILE=local.conf",
         ],
-        "flash_cmd": ["west", "flash", "--recover"],
+        # BLE needs both cores recovered before programming (clears ERASEPROTECT).
+        # ble.sh does this with nrfutil device recover, then west flash --reset.
+        "pre_flash_cmds": [
+            ["nrfutil", "device", "recover",
+             "--serial-number", "1051217937", "--core", "Network"],
+            ["nrfutil", "device", "recover",
+             "--serial-number", "1051217937", "--core", "Application"],
+        ],
+        "flash_cmd": [
+            "west", "flash",
+            "--reset",
+            "--build-dir", str(_BLE_BLD),
+            "--snr", "1051217937",
+        ],
     },
-    "53": {
-        "label":     "Thingy:53",
-        "panels":    ["Thingy53"],
-        "snr":       "1050337728",
-        "cwd":       str(_SENSOR_DIR),
+    "sensor": {
+        "label":   "Sensor",
+        "panels":  ["Thingy53"],
+        "snr":     "1050337728",
+        "cwd":     str(_WORKSPACE),
         "build_cmd": [
             "west", "build",
             "-b", "thingy53/nrf5340/cpuapp",
-            "tracker-node",
-            "--", "-DEXTRA_CONF_FILE=local.conf",
+            "--build-dir", str(_SENS_BLD),
+            str(_SENS_APP),
         ],
-        "flash_cmd": ["west", "flash"],
+        "flash_cmd": [
+            "west", "flash",
+            "--build-dir", str(_SENS_BLD),
+            "--snr", "1050337728",
+        ],
     },
 }
 
@@ -146,16 +204,16 @@ def _find_jlink_server() -> str | None:
     return None
 
 
-def _monitor_jlink(srv: dict, proc: subprocess.Popen, q: queue.Queue):
-    proc.wait()
-    stderr_out = ""
+def _pipe_jlink_stderr(srv: dict, proc: subprocess.Popen, q: queue.Queue):
+    """Forward JLinkGDBServer stderr lines to the panel in real time."""
     if proc.stderr:
-        stderr_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
-    msg = f"[JLinkGDBServer exited (code {proc.returncode})"
-    if stderr_out:
-        msg += f": {stderr_out.splitlines()[0]}"
-    msg += "]"
-    q.put((srv["label"], time.time(), msg))
+        for raw in proc.stderr:
+            line = strip_ansi(raw.decode("utf-8", errors="replace").rstrip())
+            if line:
+                q.put((srv["label"], time.time(), f"  [jlink] {line}"))
+    # Process exited — log the return code
+    q.put((srv["label"], time.time(),
+           f"[JLinkGDBServer exited (code {proc.returncode})]"))
 
 
 def spawn_jlink_servers(servers: list[dict], q: queue.Queue) -> list[subprocess.Popen]:
@@ -172,18 +230,23 @@ def spawn_jlink_servers(servers: list[dict], q: queue.Queue) -> list[subprocess.
             "-device",        srv["device"],
             "-if",            "SWD",
             "-speed",         "4000",
-            "-SelectEmuBySN", srv["serial"],
+            "-select",        f"USB={srv['serial']}",   # GDBServer flag (not -SelectEmuBySN)
             "-port",          str(srv["gdb_port"]),
             "-rtttelnetport", str(srv["rtt_port"]),
             "-nogui",
         ]
+        q.put((srv["label"], time.time(),
+               f"[spawning: {' '.join(cmd)}]"))
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.PIPE)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
             procs.append(proc)
             q.put((srv["label"], time.time(),
-                   f"[JLinkGDBServer PID {proc.pid} — RTT on :{srv['rtt_port']}]"))
-            threading.Thread(target=_monitor_jlink, args=(srv, proc, q),
+                   f"[JLinkGDBServer PID {proc.pid} — RTT telnet on :{srv['rtt_port']}]"))
+            threading.Thread(target=_pipe_jlink_stderr, args=(srv, proc, q),
                              daemon=True).start()
         except Exception as e:
             q.put((srv["label"], time.time(),
@@ -195,14 +258,22 @@ def stop_jlink_servers(procs: list[subprocess.Popen]):
     for proc in procs:
         try:
             proc.terminate()
+        except Exception:
+            pass
+    for proc in procs:
+        try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
 
 
-# ── Reader threads ──────────────────────────────────────────────────────────────
+# ── Serial reader ───────────────────────────────────────────────────────────────
 
 def serial_reader(source: str, port: str, q: queue.Queue, stop: threading.Event):
     while not stop.is_set():
@@ -231,6 +302,8 @@ def serial_reader(source: str, port: str, q: queue.Queue, stop: threading.Event)
                 q.put((source, time.time(), f"[error: {e} — retrying in 2 s]"))
                 time.sleep(2)
 
+
+# ── RTT reader ──────────────────────────────────────────────────────────────────
 
 def rtt_reader(source: str, host: str, port: int,
                q: queue.Queue, stop: threading.Event,
@@ -263,14 +336,12 @@ def rtt_reader(source: str, host: str, port: int,
                 time.sleep(3)
 
 
-# ── Device actions (reset / build / flash) ─────────────────────────────────────
+# ── Device actions ──────────────────────────────────────────────────────────────
 
 def _stream_action(tag: str, panels: list[str], cwd: str,
-                   cmd: list[str], q: queue.Queue,
-                   done_cb=None):
-    """Run cmd, stream its output to panels, call done_cb(ok: bool) when finished."""
+                   cmd: list[str], q: queue.Queue, done_cb=None):
     for p in panels:
-        q.put((p, time.time(), f"[{tag}] $ {' '.join(cmd[-4:])}"))
+        q.put((p, time.time(), f"[{tag}] $ {' '.join(cmd[-5:])}"))
     try:
         proc = subprocess.Popen(
             cmd, cwd=cwd,
@@ -296,21 +367,21 @@ def _stream_action(tag: str, panels: list[str], cwd: str,
             done_cb(False)
 
 
-def reset_device(dev: dict, q: queue.Queue):
-    exe = shutil.which("nrfjprog")
+def reset_device(snr: str, panels: list[str], q: queue.Queue):
+    exe = shutil.which("nrfutil")
     if not exe:
-        for p in dev["panels"]:
-            q.put((p, time.time(), "[nrfjprog not found — cannot reset]"))
+        for p in panels:
+            q.put((p, time.time(), "[nrfutil not found — cannot reset]"))
         return
-    for p in dev["panels"]:
-        q.put((p, time.time(), f"[pin reset → SNR {dev['snr']}]"))
+    for p in panels:
+        q.put((p, time.time(), f"[pin reset → SNR {snr}]"))
     result = subprocess.run(
-        [exe, "--reset", "--snr", dev["snr"]],
+        [exe, "device", "reset", "--serial-number", snr],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         msg = result.stderr.strip() or result.stdout.strip()
-        for p in dev["panels"]:
+        for p in panels:
             q.put((p, time.time(), f"[reset failed: {msg}]"))
 
 
@@ -321,7 +392,7 @@ class LogViewer(tk.Tk):
     def __init__(self, ble_port, lte_port):
         super().__init__()
         self.title("Tracker Dev Console")
-        self.geometry("1760x960")
+        self.geometry("1800x980")
         self.configure(bg=PALETTE["BG"])
 
         self._q           = queue.Queue()
@@ -332,7 +403,11 @@ class LogViewer(tk.Tk):
         self._recording   = False
         self._autoscroll  = {s: tk.BooleanVar(value=True) for s in SOURCES}
         self._line_count  = {s: 0 for s in SOURCES}
-        self._action_btns: dict[str, list[tk.Button]] = {}  # dev_key → buttons
+        # key → list of buttons that get disabled during an action
+        self._action_btns: dict[str, list[tk.Button]] = {}
+        # programmer SNR exclusion — prevents simultaneous flash on same DK
+        self._snr_busy: set[str] = set()
+        self._snr_mu = threading.Lock()
 
         self._build_ui()
         self._launch(ble_port, lte_port)
@@ -341,17 +416,17 @@ class LogViewer(tk.Tk):
     # ── UI construction ──────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── Log panels ───────────────────────────────────────────────────────
-        panels = tk.Frame(self, bg=PALETTE["BG"])
-        panels.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 3))
+        # ── 3 log panels ─────────────────────────────────────────────────────
+        panels_frame = tk.Frame(self, bg=PALETTE["BG"])
+        panels_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 3))
 
         self._texts = {}
         for i, src in enumerate(SOURCES):
             fg  = SOURCE_COLOR[src]
-            col = tk.Frame(panels, bg=PALETTE["BG2"])
+            col = tk.Frame(panels_frame, bg=PALETTE["BG2"])
             col.grid(row=0, column=i, sticky="nsew", padx=3)
-            panels.columnconfigure(i, weight=1)
-            panels.rowconfigure(0, weight=1)
+            panels_frame.columnconfigure(i, weight=1)
+            panels_frame.rowconfigure(0, weight=1)
 
             hdr = tk.Frame(col, bg=PALETTE["BG2"])
             hdr.pack(fill=tk.X, padx=4, pady=(4, 2))
@@ -373,41 +448,97 @@ class LogViewer(tk.Tk):
             txt.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
             self._texts[src] = txt
 
-        # ── Device action bar ─────────────────────────────────────────────────
-        act = tk.Frame(self, bg=PALETTE["BG2"], pady=5)
+        # ── Device action bar — 3 columns aligned under log panels ──────────────
+        # Tinted button styles per source
+        BTN_STYLE = {
+            "BLE":      {"bg": "#0d2030", "fg": SOURCE_COLOR["BLE"],
+                         "activebackground": "#162840"},
+            "LTE":      {"bg": "#2a1e00", "fg": SOURCE_COLOR["LTE"],
+                         "activebackground": "#3a2e10"},
+            "Thingy53": {"bg": "#0d200f", "fg": SOURCE_COLOR["Thingy53"],
+                         "activebackground": "#162a18"},
+        }
+
+        act = tk.Frame(self, bg=PALETTE["BG"], pady=2)
         act.pack(fill=tk.X, padx=6, pady=(0, 3))
+        for i in range(3):
+            act.columnconfigure(i, weight=1)
 
-        for dev_key, dev in DEVICES.items():
-            grp = tk.Frame(act, bg=PALETTE["BG2"])
-            grp.pack(side=tk.LEFT, padx=(0, 20))
+        def cbtn(parent, label, cmd, key, src):
+            style = BTN_STYLE[src]
+            b = tk.Button(
+                parent, text=label,
+                bg=style["bg"], fg=style["fg"],
+                activebackground=style["activebackground"],
+                relief=tk.FLAT, padx=6, pady=3,
+                font=("monospace", 9),
+                command=cmd,
+            )
+            b.pack(side=tk.LEFT, padx=2, pady=1)
+            self._action_btns.setdefault(key, []).append(b)
+            return b
 
-            tk.Label(grp, text=dev["label"], fg=PALETTE["FG"],
-                     bg=PALETTE["BG2"],
-                     font=("monospace", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        # ── BLE column (col 0) ────────────────────────────────────────────────
+        ble_col = tk.Frame(act, bg=PALETTE["BG"])
+        ble_col.grid(row=0, column=0, sticky="w", padx=(6, 3), pady=2)
+        ble_r0 = tk.Frame(ble_col, bg=PALETTE["BG"])
+        ble_r0.pack(fill=tk.X)
+        cbtn(ble_r0, "Build",          lambda: self._do_build("ble"),                          "ble", "BLE")
+        cbtn(ble_r0, "Build Pristine", lambda: self._do_build("ble", pristine=True),           "ble", "BLE")
+        cbtn(ble_r0, "Flash",          lambda: self._do_flash("ble"),                          "ble", "BLE")
+        ble_r1 = tk.Frame(ble_col, bg=PALETTE["BG"])
+        ble_r1.pack(fill=tk.X)
+        cbtn(ble_r1, "Build & Flash",          lambda: self._do_build_and_flash("ble"),                "ble", "BLE")
+        cbtn(ble_r1, "Build Pristine & Flash", lambda: self._do_build_and_flash("ble", pristine=True), "ble", "BLE")
 
-            btns = []
-            specs = [
-                ("Reset",          lambda d=dev: self._do_reset(d)),
-                ("Build",          lambda d=dev: self._do_build(d, pristine=False)),
-                ("Build Pristine", lambda d=dev: self._do_build(d, pristine=True)),
-                ("Flash",          lambda d=dev: self._do_flash(d)),
-            ]
-            for label, cmd in specs:
-                b = tk.Button(
-                    grp, text=label,
-                    bg=PALETTE["BG3"], fg=PALETTE["FG"],
-                    activebackground="#30363d", relief=tk.FLAT,
-                    padx=8, pady=3, font=("monospace", 9),
-                    command=cmd,
-                )
-                b.pack(side=tk.LEFT, padx=2)
-                btns.append(b)
+        # ── LTE column (col 1) ────────────────────────────────────────────────
+        lte_col = tk.Frame(act, bg=PALETTE["BG"])
+        lte_col.grid(row=0, column=1, sticky="w", padx=3, pady=2)
+        lte_r0 = tk.Frame(lte_col, bg=PALETTE["BG"])
+        lte_r0.pack(fill=tk.X)
+        cbtn(lte_r0, "Build",          lambda: self._do_build("lte"),                          "lte", "LTE")
+        cbtn(lte_r0, "Build Pristine", lambda: self._do_build("lte", pristine=True),           "lte", "LTE")
+        cbtn(lte_r0, "Flash",          lambda: self._do_flash("lte"),                          "lte", "LTE")
+        lte_r1 = tk.Frame(lte_col, bg=PALETTE["BG"])
+        lte_r1.pack(fill=tk.X)
+        cbtn(lte_r1, "Build & Flash",          lambda: self._do_build_and_flash("lte"),                "lte", "LTE")
+        cbtn(lte_r1, "Build Pristine & Flash", lambda: self._do_build_and_flash("lte", pristine=True), "lte", "LTE")
 
-            self._action_btns[dev_key] = btns
+        # ── Thingy:53 column (col 2) ──────────────────────────────────────────
+        sens_col = tk.Frame(act, bg=PALETTE["BG"])
+        sens_col.grid(row=0, column=2, sticky="w", padx=(3, 6), pady=2)
+        sens_r0 = tk.Frame(sens_col, bg=PALETTE["BG"])
+        sens_r0.pack(fill=tk.X)
+        cbtn(sens_r0, "Build",          lambda: self._do_build("sensor"),                          "sensor", "Thingy53")
+        cbtn(sens_r0, "Build Pristine", lambda: self._do_build("sensor", pristine=True),           "sensor", "Thingy53")
+        cbtn(sens_r0, "Flash",          lambda: self._do_flash("sensor"),                          "sensor", "Thingy53")
+        sens_r1 = tk.Frame(sens_col, bg=PALETTE["BG"])
+        sens_r1.pack(fill=tk.X)
+        cbtn(sens_r1, "Build & Flash",          lambda: self._do_build_and_flash("sensor"),                "sensor", "Thingy53")
+        cbtn(sens_r1, "Build Pristine & Flash", lambda: self._do_build_and_flash("sensor", pristine=True), "sensor", "Thingy53")
 
-        # ── Recording / clipboard bar ─────────────────────────────────────────
+        # ── Bottom bar: resets + recording + clipboard ────────────────────────
         bar = tk.Frame(self, bg=PALETTE["BG"], pady=4)
         bar.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        tk.Button(
+            bar, text="Reset 91X",
+            bg="#2a1e00", fg=SOURCE_COLOR["LTE"],
+            activebackground="#3a2e10", relief=tk.FLAT,
+            padx=8, pady=5, font=("monospace", 9),
+            command=self._reset_91x,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(
+            bar, text="Reset 53",
+            bg="#0d200f", fg=SOURCE_COLOR["Thingy53"],
+            activebackground="#162a18", relief=tk.FLAT,
+            padx=8, pady=5, font=("monospace", 9),
+            command=self._reset_53,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Frame(bar, bg=PALETTE["MUTE"], width=1, height=24).pack(
+            side=tk.LEFT, padx=(0, 8), fill=tk.Y)
 
         self._rec_btn = tk.Button(
             bar, text="⏺  Start recording",
@@ -422,17 +553,17 @@ class LogViewer(tk.Tk):
             bar, text="—", fg=PALETTE["MUTE"], bg=PALETTE["BG"],
             font=("monospace", 9),
         )
-        self._csv_label.pack(side=tk.LEFT, padx=(0, 16))
+        self._csv_label.pack(side=tk.LEFT, padx=(0, 12))
 
         tk.Button(
             bar, text="Clear all",
             bg=PALETTE["BG3"], fg=PALETTE["FG"],
             activebackground="#30363d", relief=tk.FLAT,
             padx=10, pady=5, command=self._clear_all,
-        ).pack(side=tk.LEFT, padx=(0, 16))
+        ).pack(side=tk.LEFT, padx=(0, 12))
 
-        sep = tk.Frame(bar, bg=PALETTE["MUTE"], width=1, height=24)
-        sep.pack(side=tk.LEFT, padx=(0, 12), fill=tk.Y)
+        tk.Frame(bar, bg=PALETTE["MUTE"], width=1, height=24).pack(
+            side=tk.LEFT, padx=(0, 8), fill=tk.Y)
 
         tk.Label(bar, text="Copy:", fg=PALETTE["MUTE"], bg=PALETTE["BG"],
                  font=("monospace", 9)).pack(side=tk.LEFT, padx=(0, 4))
@@ -490,7 +621,7 @@ class LogViewer(tk.Tk):
                 target=rtt_reader,
                 args=(srv["label"], "localhost", srv["rtt_port"],
                       self._q, self._stop),
-                kwargs={"startup_delay": 2.5},
+                kwargs={"startup_delay": 3.0},
                 daemon=True,
             ).start()
 
@@ -529,61 +660,193 @@ class LogViewer(tk.Tk):
             ])
             self._csv_file.flush()
 
+    # ── Programmer exclusion ──────────────────────────────────────────────────
+
+    def _snr_try_acquire(self, snr: str, panels: list[str]) -> bool:
+        """Return True and mark SNR busy, or post an error and return False."""
+        with self._snr_mu:
+            if snr in self._snr_busy:
+                for p in panels:
+                    self._q.put((p, time.time(),
+                                 f"[programmer {snr} busy — wait for current flash to finish]"))
+                return False
+            self._snr_busy.add(snr)
+            return True
+
+    def _snr_release(self, snr: str):
+        with self._snr_mu:
+            self._snr_busy.discard(snr)
+
     # ── Device actions ────────────────────────────────────────────────────────
 
-    def _set_action_btns(self, dev_key: str, enabled: bool):
-        for b in self._action_btns.get(dev_key, []):
+    def _set_btns(self, key: str, enabled: bool):
+        for b in self._action_btns.get(key, []):
             b.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
-    def _do_reset(self, dev: dict):
+    def _reset_91x(self):
+        rg = RESET_GROUPS["91X"]
+        with self._snr_mu:
+            if rg["snr"] in self._snr_busy:
+                for p in rg["panels"]:
+                    self._q.put((p, time.time(),
+                                 f"[reset blocked — programmer {rg['snr']} busy]"))
+                return
         threading.Thread(
-            target=reset_device, args=(dev, self._q), daemon=True,
+            target=reset_device,
+            args=(rg["snr"], rg["panels"], self._q),
+            daemon=True,
         ).start()
-        self._status.configure(text=f"Resetting {dev['label']}...")
 
-    def _do_build(self, dev: dict, pristine: bool):
-        dev_key = next(k for k, v in DEVICES.items() if v is dev)
-        self._set_action_btns(dev_key, False)
+    def _reset_53(self):
+        rg = RESET_GROUPS["53"]
+        with self._snr_mu:
+            if rg["snr"] in self._snr_busy:
+                for p in rg["panels"]:
+                    self._q.put((p, time.time(),
+                                 f"[reset blocked — programmer {rg['snr']} busy]"))
+                return
+        threading.Thread(
+            target=reset_device,
+            args=(rg["snr"], rg["panels"], self._q),
+            daemon=True,
+        ).start()
 
-        cmd = NRFUTIL_WRAP + dev["build_cmd"]
+    def _do_build(self, key: str, pristine: bool = False):
+        tgt = TARGETS[key]
+        self._set_btns(key, False)
+
+        base_cmd = NRFUTIL_WRAP + tgt["build_cmd"]
         if pristine:
-            # insert --pristine before the first '--' separator
-            sep = cmd.index("--", len(NRFUTIL_WRAP))
-            cmd = cmd[:sep] + ["--pristine"] + cmd[sep:]
+            # Insert --pristine right after 'west build'
+            west_idx  = base_cmd.index("west")
+            base_cmd  = (base_cmd[:west_idx + 2]
+                         + ["--pristine"]
+                         + base_cmd[west_idx + 2:])
 
-        tag = f"build{'  pristine' if pristine else ''}"
-        self._status.configure(text=f"Building {dev['label']}...")
+        tag = f"build {'pristine' if pristine else ''}{key}".strip()
+        self._status.configure(
+            text=f"Building {tgt['label']}{'  (pristine)' if pristine else ''}...")
 
         def done(ok):
-            self.after(0, lambda: self._set_action_btns(dev_key, True))
+            self.after(0, lambda: self._set_btns(key, True))
             self.after(0, lambda: self._status.configure(
-                text=f"{dev['label']} build {'OK' if ok else 'FAILED'}"))
+                text=f"{tgt['label']} build {'OK' if ok else 'FAILED'}"))
 
         threading.Thread(
             target=_stream_action,
-            args=(tag, dev["panels"], dev["cwd"], cmd, self._q),
+            args=(tag, tgt["panels"], tgt["cwd"], base_cmd, self._q),
             kwargs={"done_cb": done},
             daemon=True,
         ).start()
 
-    def _do_flash(self, dev: dict):
-        dev_key = next(k for k, v in DEVICES.items() if v is dev)
-        self._set_action_btns(dev_key, False)
+    def _do_flash(self, key: str):
+        tgt = TARGETS[key]
+        self._set_btns(key, False)
+        self._status.configure(text=f"Flashing {tgt['label']}...")
 
-        cmd = NRFUTIL_WRAP + dev["flash_cmd"]
-        self._status.configure(text=f"Flashing {dev['label']}...")
+        def flash_thread():
+            panels = tgt["panels"]
+            cwd    = tgt["cwd"]
+            snr    = tgt.get("snr")
 
-        def done(ok):
-            self.after(0, lambda: self._set_action_btns(dev_key, True))
+            if snr and not self._snr_try_acquire(snr, panels):
+                self.after(0, lambda: self._set_btns(key, True))
+                self.after(0, lambda: self._status.configure(
+                    text=f"{tgt['label']} flash blocked — programmer {snr} busy"))
+                return
+
+            try:
+                for pre_cmd in tgt.get("pre_flash_cmds", []):
+                    for p in panels:
+                        self._q.put((p, time.time(),
+                                     f"[pre-flash] $ {' '.join(pre_cmd[-4:])}"))
+                    result = subprocess.run(pre_cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        msg = result.stderr.strip() or result.stdout.strip()
+                        for p in panels:
+                            self._q.put((p, time.time(), f"[pre-flash failed: {msg}]"))
+                        self.after(0, lambda: self._set_btns(key, True))
+                        self.after(0, lambda: self._status.configure(
+                            text=f"{tgt['label']} flash FAILED (pre-flash)"))
+                        return
+
+                flash_cmd = NRFUTIL_WRAP + tgt["flash_cmd"]
+
+                def done(ok):
+                    self.after(0, lambda: self._set_btns(key, True))
+                    self.after(0, lambda: self._status.configure(
+                        text=f"{tgt['label']} flash {'OK' if ok else 'FAILED'}"))
+
+                _stream_action("flash", panels, cwd, flash_cmd, self._q, done_cb=done)
+            finally:
+                if snr:
+                    self._snr_release(snr)
+
+        threading.Thread(target=flash_thread, daemon=True).start()
+
+    def _do_build_and_flash(self, key: str, pristine: bool = False):
+        """Build then flash in sequence."""
+        tgt = TARGETS[key]
+        self._set_btns(key, False)
+        label = f"{tgt['label']}{'  (pristine)' if pristine else ''}"
+        self._status.configure(text=f"Building {label}...")
+
+        def after_build(ok):
+            if not ok:
+                self.after(0, lambda: self._set_btns(key, True))
+                self.after(0, lambda: self._status.configure(
+                    text=f"{tgt['label']} build FAILED — flash skipped"))
+                return
+
+            panels = tgt["panels"]
+            cwd    = tgt["cwd"]
+            snr    = tgt.get("snr")
+
+            if snr and not self._snr_try_acquire(snr, panels):
+                self.after(0, lambda: self._set_btns(key, True))
+                self.after(0, lambda: self._status.configure(
+                    text=f"{tgt['label']} flash blocked — programmer {snr} busy"))
+                return
+
             self.after(0, lambda: self._status.configure(
-                text=f"{dev['label']} flash {'OK — resetting' if ok else 'FAILED'}"))
-            if ok:
-                self.after(500, lambda: self._do_reset(dev))
+                text=f"Flashing {tgt['label']}..."))
 
+            try:
+                for pre_cmd in tgt.get("pre_flash_cmds", []):
+                    for p in panels:
+                        self._q.put((p, time.time(),
+                                     f"[pre-flash] $ {' '.join(pre_cmd[-4:])}"))
+                    result = subprocess.run(pre_cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        msg = result.stderr.strip() or result.stdout.strip()
+                        for p in panels:
+                            self._q.put((p, time.time(), f"[pre-flash failed: {msg}]"))
+                        self.after(0, lambda: self._set_btns(key, True))
+                        self.after(0, lambda: self._status.configure(
+                            text=f"{tgt['label']} flash FAILED (pre-flash)"))
+                        return
+                flash_cmd = NRFUTIL_WRAP + tgt["flash_cmd"]
+
+                def done(ok2):
+                    self.after(0, lambda: self._set_btns(key, True))
+                    suffix = "pristine build & flash" if pristine else "build & flash"
+                    self.after(0, lambda: self._status.configure(
+                        text=f"{tgt['label']} {suffix} {'OK' if ok2 else 'FAILED'}"))
+
+                _stream_action("flash", panels, cwd, flash_cmd, self._q, done_cb=done)
+            finally:
+                if snr:
+                    self._snr_release(snr)
+
+        base_cmd = NRFUTIL_WRAP + tgt["build_cmd"]
+        if pristine:
+            west_idx = base_cmd.index("west")
+            base_cmd = base_cmd[:west_idx + 2] + ["--pristine"] + base_cmd[west_idx + 2:]
+        tag = f"build {'pristine ' if pristine else ''}{key}".strip()
         threading.Thread(
             target=_stream_action,
-            args=("flash", dev["panels"], dev["cwd"], cmd, self._q),
-            kwargs={"done_cb": done},
+            args=(tag, tgt["panels"], tgt["cwd"], base_cmd, self._q),
+            kwargs={"done_cb": after_build},
             daemon=True,
         ).start()
 

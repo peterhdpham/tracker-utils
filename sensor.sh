@@ -14,7 +14,7 @@
 set -euo pipefail
 
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SNR="${SNR_SENSOR:-1050337728}"   # nRF52 DK → Thingy:53 SWD pads
+SNR="${SNR_SENSOR:-1050065248}"   # nRF52 DK → Thingy:53 SWD pads
 DEVICE="NRF5340_XXAA_APP"
 BUILD_DIR="${WORKSPACE}/build/sensor"
 

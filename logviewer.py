@@ -467,6 +467,8 @@ class LogViewer(tk.Tk):
         self._action_btns: dict[str, list[tk.Button]] = {}
         # sources currently mid-reset: suppress raw disconnect/connect messages
         self._resetting_sources: set[str] = set()
+        # sources waiting for their *** Booting banner after a refresh
+        self._waiting_for_boot: set[str] = set()
         # programmer SNR exclusion — prevents simultaneous flash on same DK
         self._snr_busy: set[str] = set()
         self._snr_mu = threading.Lock()
@@ -803,6 +805,14 @@ class LogViewer(tk.Tk):
                 self._resetting_sources.discard(source)
                 msg = f"[↺ {name} rebooted]"
 
+        if source in self._waiting_for_boot:
+            if "*** Booting" in msg:
+                self._waiting_for_boot.discard(source)
+                self._clear_source(source)
+                # fall through — display this line as the first entry
+            else:
+                return  # drop everything before the boot banner
+
         buf = self._all_lines[source]
         buf.append((wall, msg, kind))
         if len(buf) > 6000:
@@ -972,6 +982,7 @@ class LogViewer(tk.Tk):
         self._clear_all()
         self._status.configure(text="Refreshing…")
         self._resetting_sources.update(SOURCES)
+        self._waiting_for_boot.update(SOURCES)
         # reset all via BLE shell (resets nRF9151 then reboots nRF5340)
         self._shell_cmd("BLE", "reset all")
         # reset Thingy:53 via nrfutil (no shell on Thingy:53)
@@ -1224,6 +1235,15 @@ class LogViewer(tk.Tk):
         self._status.configure(text=f"Copied {content.count(chr(10))} lines to clipboard")
 
     # ── Clear ─────────────────────────────────────────────────────────────────
+
+    def _clear_source(self, source: str):
+        txt = self._texts.get(source)
+        if txt:
+            txt.configure(state=tk.NORMAL)
+            txt.delete("1.0", tk.END)
+            txt.configure(state=tk.DISABLED)
+        self._line_count[source] = 0
+        self._all_lines[source] = []
 
     def _clear_all(self):
         for src, txt in self._texts.items():

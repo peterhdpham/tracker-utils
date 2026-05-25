@@ -105,6 +105,7 @@ TARGETS = {
             "--build-dir", str(_BLE_BLD),
             str(_BLE_APP),
         ],
+        "optional_conf": _BLE_APP / "local.conf",
         # Recover Application core before programming (clears ERASEPROTECT/APPROTECT).
         # Network core recovery is skipped — the Thingy:91X Debug In connector does
         # not expose the nRF5340 Network core SWD pins separately.
@@ -114,7 +115,7 @@ TARGETS = {
         ],
         "flash_cmd": [
             "west", "flash",
-            "--reset",
+            "--recover",
             "--build-dir", str(_BLE_BLD),
             "--snr", "1051217937",
         ],
@@ -353,7 +354,7 @@ def serial_reader(source: str, port: str, q: queue.Queue, stop: threading.Event,
                 if not (quiet and quiet.is_set()) and was_connected:
                     q.put((source, time.time(), f"[disconnected: {e}]", "status"))
                 was_connected = False
-                time.sleep(0.1)   # fast retry — catch device reboots quickly
+                time.sleep(0.05)  # fast retry — catch device reboots quickly
         except Exception as e:
             if not stop.is_set():
                 if was_connected:
@@ -361,7 +362,7 @@ def serial_reader(source: str, port: str, q: queue.Queue, stop: threading.Event,
                 if not (quiet and quiet.is_set()) and was_connected:
                     q.put((source, time.time(), f"[error: {e}]", "status"))
                 was_connected = False
-                time.sleep(0.1)
+                time.sleep(0.05)
 
 
 # ── RTT reader ──────────────────────────────────────────────────────────────────
@@ -804,6 +805,8 @@ class LogViewer(tk.Tk):
             elif msg.startswith("[connected →") and source in self._resetting_sources:
                 self._resetting_sources.discard(source)
                 msg = f"[↺ {name} rebooted]"
+            elif msg.startswith("[disconnected:") or msg.startswith("[connected →"):
+                return
 
         if source in self._waiting_for_boot:
             if "*** Booting" in msg:
@@ -982,7 +985,6 @@ class LogViewer(tk.Tk):
         self._clear_all()
         self._status.configure(text="Refreshing…")
         self._resetting_sources.update(SOURCES)
-        self._waiting_for_boot.update(SOURCES)
         # reset all via BLE shell (resets nRF9151 then reboots nRF5340)
         self._shell_cmd("BLE", "reset all")
         # reset Thingy:53 via nrfutil (no shell on Thingy:53)

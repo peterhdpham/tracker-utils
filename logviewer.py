@@ -87,7 +87,6 @@ TARGETS = {
             "--sysbuild",
         ],
         "optional_conf": _LTE_APP / "local.conf",
-        "security_conf_files": [_LTE_APP / "oscore.conf", _LTE_APP / "dtls.conf"],
         "flash_cmd": [
             "west", "flash",
             "--recover",
@@ -108,6 +107,11 @@ TARGETS = {
             "--sysbuild",
         ],
         "optional_conf": _BLE_APP / "local.conf",
+        "security_conf_files": [_BLE_APP / "security.conf"],
+        # sysbuild does not forward EXTRA_CONF_FILE to child images; use the image-specific
+        # variable so conf files reach the BLE image (NCS sysbuild names it tracker-hub-ble,
+        # matching the app directory name — not the cmake project name ble_central).
+        "cmake_image": "tracker-hub-ble",
         # Recover Application core before programming (clears ERASEPROTECT/APPROTECT).
         # Network core recovery is skipped — the Thingy:91X Debug In connector does
         # not expose the nRF5340 Network core SWD pins separately.
@@ -134,7 +138,7 @@ TARGETS = {
             str(_SENS_APP),
         ],
         "optional_conf": _SENS_APP / "local.conf",
-        "security_conf_files": [_SENS_APP / "oscore.conf"],
+        "security_conf_files": [_SENS_APP / "security.conf"],
         "flash_cmd": [
             "west", "flash",
             "--build-dir", str(_SENS_BLD),
@@ -154,7 +158,9 @@ def _effective_build_cmd(tgt: dict) -> list:
         if Path(sc).exists():
             conf_files.append(str(sc))
     if conf_files:
-        cmd += ["--", f"-DEXTRA_CONF_FILE={';'.join(conf_files)}"]
+        cmake_image = tgt.get("cmake_image")
+        var = f"{cmake_image}_EXTRA_CONF_FILE" if cmake_image else "EXTRA_CONF_FILE"
+        cmd += ["--", f"-D{var}={';'.join(conf_files)}"]
     return cmd
 
 # ── Display ──────────────────────────────────────────────────────────────────────
@@ -515,6 +521,8 @@ class LogViewer(tk.Tk):
         self.title("Tracker Dev Console")
         self.geometry("1800x980")
         self.configure(bg=PALETTE["BG"])
+        self.after(0, lambda: self.state("zoomed") if sys.platform == "win32"
+                   else self.attributes("-zoomed", True))
 
         self._q           = queue.Queue()
         self._stop        = threading.Event()
@@ -557,6 +565,7 @@ class LogViewer(tk.Tk):
         self._current_ble      = "gatt_oscore"
         self._coap_current_lbl: tk.Label | None = None
         self._ble_current_lbl:  tk.Label | None = None
+        self._build_conf_labels: dict[str, list[tuple[tk.Label, Path]]] = {}
 
         self._build_ui()
         # initialise mode selectors from local.conf
@@ -569,6 +578,7 @@ class LogViewer(tk.Tk):
         self._update_mode_indicators()
         self._coap_mode_var.trace_add("write", lambda *_: self._update_mode_indicators())
         self._ble_mode_var.trace_add("write",  lambda *_: self._update_mode_indicators())
+        self._refresh_build_conf_display()
 
         self._launch(ble_port, lte_port, sensor_port)
         self._poll()
@@ -1212,6 +1222,33 @@ class LogViewer(tk.Tk):
 
         tk.Frame(cfg, bg=PALETTE["BG3"], height=1).pack(fill=tk.X, padx=6, pady=(4, 6))
 
+        # ── Build conf files ──────────────────────────────────────────────────
+        conf_sec = tk.Frame(cfg, bg=PALETTE["BG2"])
+        conf_sec.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Label(conf_sec, text="Build conf files", fg=PALETTE["MUTE"],
+                 bg=PALETTE["BG2"], font=("monospace", 8)).pack(anchor="w", pady=(0, 2))
+
+        for key, display in [("ble", "BLE"), ("lte", "LTE"), ("sensor", "Sensor")]:
+            row = tk.Frame(conf_sec, bg=PALETTE["BG2"])
+            row.pack(anchor="w", fill=tk.X)
+            tk.Label(row, text=f"{display:<7}", fg=PALETTE["MUTE"], bg=PALETTE["BG2"],
+                     font=("monospace", 8)).pack(side=tk.LEFT)
+            self._build_conf_labels[key] = []
+            tgt = TARGETS[key]
+            conf_entries: list[tuple[str, Path]] = []
+            main_conf = tgt.get("optional_conf")
+            if main_conf:
+                conf_entries.append(("local.conf", Path(main_conf)))
+            for sc in tgt.get("security_conf_files", []):
+                conf_entries.append((Path(sc).name, Path(sc)))
+            for name, path in conf_entries:
+                lbl = tk.Label(row, text=name, fg=PALETTE["MUTE"], bg=PALETTE["BG2"],
+                               font=("monospace", 8))
+                lbl.pack(side=tk.LEFT, padx=(0, 8))
+                self._build_conf_labels[key].append((lbl, path))
+
+        tk.Frame(cfg, bg=PALETTE["BG3"], height=1).pack(fill=tk.X, padx=6, pady=(4, 6))
+
         # ── Apply button ──────────────────────────────────────────────────────
         bottom = tk.Frame(cfg, bg=PALETTE["BG2"])
         bottom.pack(fill=tk.X, padx=8, pady=(0, 6))
@@ -1249,8 +1286,15 @@ class LogViewer(tk.Tk):
             else:
                 self._ble_current_lbl.configure(text=human, fg=PALETTE["GRN"])
 
+    def _refresh_build_conf_display(self):
+        _SRC = {"ble": "BLE", "lte": "LTE", "sensor": "Thingy53"}
+        for key, entries in self._build_conf_labels.items():
+            active_color = SOURCE_COLOR[_SRC[key]]
+            for lbl, path in entries:
+                lbl.configure(fg=active_color if path.exists() else PALETTE["MUTE"])
+
     def _read_coap_mode(self) -> str:
-        conf = _LTE_APP / "local.conf"
+        conf = _BLE_APP / "security.conf"
         if conf.exists():
             m = _COAP_MODE_PAT.search(conf.read_text())
             if m:
@@ -1258,12 +1302,23 @@ class LogViewer(tk.Tk):
         return "oscore"
 
     def _read_ble_mode(self) -> str:
-        conf = _SENS_APP / "local.conf"
+        conf = _SENS_APP / "security.conf"
         if conf.exists():
             m = _BLE_MODE_PAT.search(conf.read_text())
             if m:
                 return m.group(1).lower()
         return "gatt_oscore"
+
+    def _update_kconfig_key(self, path: Path, line: str):
+        """Replace or append a single Kconfig key=value line in path."""
+        key = line.split("=")[0]
+        text = path.read_text() if path.exists() else ""
+        pat = re.compile(rf"^{re.escape(key)}=.*", re.M)
+        if pat.search(text):
+            text = pat.sub(line, text)
+        else:
+            text = text.rstrip("\n") + "\n" + line + "\n"
+        path.write_text(text)
 
     def _set_kconfig_mode(self, path: Path, prefix: str, new_line: str):
         text = path.read_text() if path.exists() else ""
@@ -1282,20 +1337,20 @@ class LogViewer(tk.Tk):
                          f"[Applying: CoAP={coap}  BLE={ble}]", "status"))
             try:
                 self._set_kconfig_mode(
-                    _LTE_APP / "local.conf",
+                    _BLE_APP / "security.conf",
                     "CONFIG_APP_COAP_SECURITY_",
                     f"CONFIG_APP_COAP_SECURITY_{coap.upper()}=y",
                 )
                 self._q.put(("Server", time.time(),
-                             f"  → hub LTE local.conf: COAP_SECURITY_{coap.upper()}", "build"))
+                             f"  → hub BLE security.conf: COAP_SECURITY_{coap.upper()}", "build"))
 
                 self._set_kconfig_mode(
-                    _SENS_APP / "local.conf",
+                    _SENS_APP / "security.conf",
                     "CONFIG_APP_BLE_SECURITY_",
                     f"CONFIG_APP_BLE_SECURITY_{ble.upper()}=y",
                 )
                 self._q.put(("Server", time.time(),
-                             f"  → sensor local.conf: BLE_SECURITY_{ble.upper()}", "build"))
+                             f"  → sensor security.conf: BLE_SECURITY_{ble.upper()}", "build"))
 
                 env_cmd = (
                     f"python3 -c \""
@@ -1312,7 +1367,7 @@ class LogViewer(tk.Tk):
 
                 self._ssh_restart_server()
                 self._q.put(("Server", time.time(),
-                             "[local.conf written, server restarted — rebuild+reflash firmware]",
+                             "[security.conf written, server restarted — rebuild+reflash BLE and sensor]",
                              "status"))
             except Exception as e:
                 self._q.put(("Server", time.time(), f"[apply error: {e}]", "status"))
@@ -1363,7 +1418,7 @@ class LogViewer(tk.Tk):
                      "-o", "StrictHostKeyChecking=accept-new",
                      "-o", "ConnectTimeout=10",
                      SSH_SERVER_HOST,
-                     "cd tracker-server && docker compose restart coap-server 2>&1"],
+                     "cd tracker-server && docker compose up --force-recreate -d coap-server 2>&1"],
                     capture_output=True, text=True, timeout=60,
                 )
                 ok = result.returncode == 0
@@ -1381,8 +1436,8 @@ class LogViewer(tk.Tk):
         def run():
             self._q.put(("Server", time.time(), "[OSCORE key rotation started]", "status"))
             try:
-                for name, conf_path in [("hub",    _LTE_APP  / "oscore.conf"),
-                                         ("sensor", _SENS_APP / "oscore.conf")]:
+                for name, conf_path in [("hub",    _BLE_APP  / "security.conf"),
+                                         ("sensor", _SENS_APP / "security.conf")]:
                     self._q.put(("Server", time.time(),
                                  f"[generate_oscore_psk.py --name {name}]", "build"))
                     r = subprocess.run(
@@ -1401,7 +1456,8 @@ class LogViewer(tk.Tk):
                         return
                     conf_lines = [ln for ln in r.stdout.splitlines()
                                   if ln.startswith("CONFIG_APP_OSCORE_")]
-                    conf_path.write_text("\n".join(conf_lines) + "\n")
+                    for ln in conf_lines:
+                        self._update_kconfig_key(conf_path, ln)
                     self._q.put(("Server", time.time(), f"  → wrote {conf_path}", "build"))
 
                 # Ensure OSCORE_CONTEXT_DIR is set to the in-container mount path
@@ -1450,8 +1506,9 @@ class LogViewer(tk.Tk):
 
                 conf_lines = [ln for ln in r.stdout.splitlines()
                               if ln.startswith("CONFIG_APP_DTLS_")]
-                dtls_conf = _LTE_APP / "dtls.conf"
-                dtls_conf.write_text("\n".join(conf_lines) + "\n")
+                dtls_conf = _BLE_APP / "security.conf"
+                for ln in conf_lines:
+                    self._update_kconfig_key(dtls_conf, ln)
                 self._q.put(("Server", time.time(), f"  → wrote {dtls_conf}", "build"))
 
                 env_vals = {}
@@ -1483,7 +1540,7 @@ class LogViewer(tk.Tk):
 
                 self._ssh_restart_server()
                 self._q.put(("Server", time.time(),
-                             "[DTLS rotation done — rebuild + reflash hub]", "status"))
+                             "[DTLS rotation done — rebuild + reflash BLE]", "status"))
             except Exception as e:
                 self._q.put(("Server", time.time(),
                              f"[DTLS rotation error: {e}]", "status"))
@@ -1521,6 +1578,7 @@ class LogViewer(tk.Tk):
             status_txt = f"{lbl} build {'OK' if ok else 'FAILED'}"
             self._q.put((_UI_, time.time(), lambda: self._set_btns(key, True)))
             self._q.put((_UI_, time.time(), lambda: self._status.configure(text=status_txt)))
+            self._q.put((_UI_, time.time(), self._refresh_build_conf_display))
             for p in _panels:
                 self._q.put((p, time.time(), f"[{build_label} {'OK' if ok else 'FAILED'}]", "status"))
                 self._q.put((_UI_, time.time(), lambda p=p, t=txt, o=ok:
@@ -1581,7 +1639,7 @@ class LogViewer(tk.Tk):
                         self._q.put((_UI_, time.time(), lambda p=p, t=txt, o=ok:
                                      self._set_panel_status(p, t, o)))
                     if ok:
-                        if key == "lte":
+                        if key == "ble":
                             self._current_coap = self._coap_mode_var.get()
                         elif key == "sensor":
                             self._current_ble = self._ble_mode_var.get()
@@ -1657,13 +1715,14 @@ class LogViewer(tk.Tk):
                 def done(ok2, _panels=panels, _suffix=suffix):
                     txt = f"{_suffix} {'OK' if ok2 else 'FAILED'}"
                     _ui(f"{lbl} {_suffix.lower()} {'OK' if ok2 else 'FAILED'}")
+                    self._q.put((_UI_, time.time(), self._refresh_build_conf_display))
                     for p in _panels:
                         self._q.put((p, time.time(),
                                      f"[Flash {'OK' if ok2 else 'FAILED'}]", "status"))
                         self._q.put((_UI_, time.time(), lambda p=p, t=txt, o=ok2:
                                      self._set_panel_status(p, t, o)))
                     if ok2:
-                        if key == "lte":
+                        if key == "ble":
                             self._current_coap = self._coap_mode_var.get()
                         elif key == "sensor":
                             self._current_ble = self._ble_mode_var.get()

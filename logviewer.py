@@ -87,6 +87,7 @@ TARGETS = {
             "--sysbuild",
         ],
         "optional_conf": _LTE_APP / "local.conf",
+        "security_conf_files": [_LTE_APP / "oscore.conf", _LTE_APP / "dtls.conf"],
         "flash_cmd": [
             "west", "flash",
             "--recover",
@@ -133,6 +134,7 @@ TARGETS = {
             str(_SENS_APP),
         ],
         "optional_conf": _SENS_APP / "local.conf",
+        "security_conf_files": [_SENS_APP / "oscore.conf"],
         "flash_cmd": [
             "west", "flash",
             "--build-dir", str(_SENS_BLD),
@@ -143,17 +145,23 @@ TARGETS = {
 
 
 def _effective_build_cmd(tgt: dict) -> list:
-    """Append -DEXTRA_CONF_FILE to build_cmd only when optional_conf exists."""
     cmd = list(tgt["build_cmd"])
-    conf = tgt.get("optional_conf")
-    if conf and Path(conf).exists():
-        cmd += ["--", f"-DEXTRA_CONF_FILE={conf}"]
+    conf_files = []
+    main_conf = tgt.get("optional_conf")
+    if main_conf and Path(main_conf).exists():
+        conf_files.append(str(main_conf))
+    for sc in tgt.get("security_conf_files", []):
+        if Path(sc).exists():
+            conf_files.append(str(sc))
+    if conf_files:
+        cmd += ["--", f"-DEXTRA_CONF_FILE={';'.join(conf_files)}"]
     return cmd
 
 # ── Display ──────────────────────────────────────────────────────────────────────
 
 BAUD    = 115200
-SOURCES = ["BLE", "LTE", "Thingy53"]
+SOURCES         = ["BLE", "LTE", "Thingy53", "Server"]
+_DEVICE_SOURCES = ["BLE", "LTE", "Thingy53"]
 
 PALETTE = {
     "BG":   "#0d1117",
@@ -169,12 +177,14 @@ SOURCE_COLOR = {
     "BLE":      "#58c4dd",
     "LTE":      "#e6a817",
     "Thingy53": "#57ab5a",
+    "Server":   "#a371f7",
 }
 
 _RESET_LABEL = {
     "BLE":      "Thingy:91X (BLE)",
     "LTE":      "Thingy:91X (LTE)",
     "Thingy53": "Thingy:53",
+    "Server":   "Server",
 }
 
 _ANSI_RE     = re.compile(r"\x1b(?:\[[0-9;]*[A-Za-z]|[A-Za-z])")
@@ -188,6 +198,26 @@ LOG_LEVEL_COLOR = {
     "err": "#ff7b72",   # red
     "wrn": "#e3b341",   # amber
 }
+
+
+SSH_SERVER_HOST = "root@10.10.10.10"
+SSH_SERVER_CMD  = "cd tracker-server && docker compose logs -f"
+
+_COAP_LABELS = [
+    ("none",        "None"),
+    ("oscore",      "OSCORE"),
+    ("dtls",        "DTLS"),
+    ("dtls_oscore", "DTLS+OSCORE"),
+]
+_BLE_LABELS = [
+    ("gatt",             "GATT"),
+    ("gatt_oscore",      "GATT+OSCORE"),
+    ("lesc",             "LESC"),
+    ("broadcast",        "Broadcast"),
+    ("broadcast_oscore", "Broadcast+OSCORE"),
+]
+_COAP_MODE_PAT = re.compile(r"^CONFIG_APP_COAP_SECURITY_(\w+)=y", re.M)
+_BLE_MODE_PAT  = re.compile(r"^CONFIG_APP_BLE_SECURITY_(\w+)=y",  re.M)
 
 
 def strip_ansi(s: str) -> str:
@@ -402,6 +432,45 @@ def rtt_reader(source: str, host: str, port: int,
                 time.sleep(3)
 
 
+# ── SSH log reader ──────────────────────────────────────────────────────────────
+
+def ssh_log_reader(source: str, host: str, remote_cmd: str,
+                   q: queue.Queue, stop: threading.Event,
+                   retry_delay: float = 5.0):
+    _dbg(f"ssh_log_reader [{source}]: connecting to {host}")
+    while not stop.is_set():
+        q.put((source, time.time(), f"[SSH connecting → {host}]", "status"))
+        try:
+            proc = subprocess.Popen(
+                ["ssh",
+                 "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "ServerAliveInterval=10",
+                 "-o", "ConnectTimeout=10",
+                 host, remote_cmd],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            _dbg(f"ssh_log_reader [{source}]: PID {proc.pid}")
+            for raw in proc.stdout:
+                if stop.is_set():
+                    break
+                line = strip_ansi(raw.decode("utf-8", errors="replace").rstrip())
+                if line:
+                    q.put((source, time.time(), line, "dev"))
+            proc.wait()
+            if not stop.is_set():
+                q.put((source, time.time(),
+                       f"[SSH closed (exit {proc.returncode}) — retrying in {retry_delay:.0f}s]",
+                       "status"))
+                time.sleep(retry_delay)
+        except Exception as e:
+            if not stop.is_set():
+                _dbg(f"ssh_log_reader [{source}]: error: {e}")
+                q.put((source, time.time(),
+                       f"[SSH error: {e} — retrying in {retry_delay:.0f}s]", "status"))
+                time.sleep(retry_delay)
+
+
 # ── Device actions ──────────────────────────────────────────────────────────────
 
 def _stream_action(tag: str, panels: list[str], cwd: str,
@@ -479,29 +548,64 @@ class LogViewer(tk.Tk):
             "1051217937": threading.Event(),
             "1050065248": threading.Event(),
         }
+        # server branch label widget (set by _build_ui, updated by _fetch_server_branch)
+        self._server_branch_lbl: tk.Label | None = None
+        # security config panel state
+        self._coap_mode_var    = tk.StringVar(value="oscore")
+        self._ble_mode_var     = tk.StringVar(value="gatt_oscore")
+        self._current_coap     = "oscore"
+        self._current_ble      = "gatt_oscore"
+        self._coap_current_lbl: tk.Label | None = None
+        self._ble_current_lbl:  tk.Label | None = None
 
         self._build_ui()
+        # initialise mode selectors from local.conf
+        c = self._read_coap_mode()
+        b = self._read_ble_mode()
+        self._current_coap = c
+        self._current_ble  = b
+        self._coap_mode_var.set(c)
+        self._ble_mode_var.set(b)
+        self._update_mode_indicators()
+        self._coap_mode_var.trace_add("write", lambda *_: self._update_mode_indicators())
+        self._ble_mode_var.trace_add("write",  lambda *_: self._update_mode_indicators())
+
         self._launch(ble_port, lte_port, sensor_port)
         self._poll()
 
     # ── UI construction ──────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── 3 log panels ─────────────────────────────────────────────────────
+        # ── Log panels — Server on top (full-width), devices below ───────────
         panels_frame = tk.Frame(self, bg=PALETTE["BG"])
         panels_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 3))
 
-        self._texts = {}
-        for i, src in enumerate(SOURCES):
-            fg  = SOURCE_COLOR[src]
-            col = tk.Frame(panels_frame, bg=PALETTE["BG2"])
-            col.grid(row=0, column=i, sticky="nsew", padx=3)
+        for i in range(3):
             panels_frame.columnconfigure(i, weight=1)
-            panels_frame.rowconfigure(0, weight=1)
+        panels_frame.rowconfigure(0, weight=1, minsize=200)  # Server row
+        panels_frame.rowconfigure(1, weight=3)               # Device row
+
+        self._texts = {}
+        for src in SOURCES:
+            fg        = SOURCE_COLOR[src]
+            is_server = (src == "Server")
+
+            if is_server:
+                # Outer container for the full server row; holds log (left) + config (right)
+                server_row = tk.Frame(panels_frame, bg=PALETTE["BG"])
+                server_row.grid(row=0, column=0, columnspan=3, sticky="nsew",
+                                padx=3, pady=(0, 3))
+                col = tk.Frame(server_row, bg=PALETTE["BG2"])
+                col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
+            else:
+                dev_idx = _DEVICE_SOURCES.index(src)
+                col = tk.Frame(panels_frame, bg=PALETTE["BG2"])
+                col.grid(row=1, column=dev_idx, sticky="nsew", padx=3)
 
             hdr = tk.Frame(col, bg=PALETTE["BG2"])
             hdr.pack(fill=tk.X, padx=4, pady=(4, 2))
-            tk.Label(hdr, text=src, fg=fg, bg=PALETTE["BG2"],
+            lbl_text = "Server  (docker compose logs)" if is_server else src
+            tk.Label(hdr, text=lbl_text, fg=fg, bg=PALETTE["BG2"],
                      font=("monospace", 11, "bold")).pack(side=tk.LEFT)
             tk.Checkbutton(
                 hdr, text="auto-scroll",
@@ -510,21 +614,42 @@ class LogViewer(tk.Tk):
                 selectcolor=PALETTE["BG3"],
                 activebackground=PALETTE["BG2"], bd=0,
             ).pack(side=tk.RIGHT)
-            tab_frame = tk.Frame(hdr, bg=PALETTE["BG2"])
-            tab_frame.pack(side=tk.RIGHT, padx=(4, 0))
+
             self._tab_btns[src] = {}
-            for tab_label, tab_key in [("UART", "uart"), ("Build", "build"), ("Both", "both")]:
-                is_active = (tab_key == "uart")
-                b = tk.Button(
-                    tab_frame, text=tab_label,
-                    bg="#21262d" if is_active else PALETTE["BG3"],
-                    fg=fg if is_active else PALETTE["MUTE"],
-                    activebackground="#30363d", relief=tk.FLAT,
-                    padx=6, pady=1, font=("monospace", 8),
-                    command=lambda s=src, t=tab_key: self._switch_tab(s, t),
-                )
-                b.pack(side=tk.LEFT, padx=1)
-                self._tab_btns[src][tab_key] = b
+            if not is_server:
+                tab_frame = tk.Frame(hdr, bg=PALETTE["BG2"])
+                tab_frame.pack(side=tk.RIGHT, padx=(4, 0))
+                for tab_label, tab_key in [("UART", "uart"), ("Build", "build"), ("Both", "both")]:
+                    is_active = (tab_key == "uart")
+                    b = tk.Button(
+                        tab_frame, text=tab_label,
+                        bg="#21262d" if is_active else PALETTE["BG3"],
+                        fg=fg if is_active else PALETTE["MUTE"],
+                        activebackground="#30363d", relief=tk.FLAT,
+                        padx=6, pady=1, font=("monospace", 8),
+                        command=lambda s=src, t=tab_key: self._switch_tab(s, t),
+                    )
+                    b.pack(side=tk.LEFT, padx=1)
+                    self._tab_btns[src][tab_key] = b
+
+            if is_server:
+                srv_btns = tk.Frame(col, bg=PALETTE["BG2"])
+                srv_btns.pack(fill=tk.X, padx=4, pady=(0, 2))
+                _SRV_BTN = {"bg": "#1a0d2e", "fg": fg,
+                            "activebackground": "#2a1a42", "relief": tk.FLAT,
+                            "font": ("monospace", 9)}
+                tk.Button(srv_btns, text="Clear", padx=6, pady=2,
+                          command=lambda: self._clear_source("Server"),
+                          **_SRV_BTN).pack(side=tk.LEFT, padx=(0, 4))
+                tk.Button(srv_btns, text="↺ Restart coap-server", padx=6, pady=2,
+                          command=self._ssh_restart_server,
+                          **_SRV_BTN).pack(side=tk.LEFT, padx=(0, 4))
+                tk.Button(srv_btns, text="⟳ Rotate OSCORE", padx=6, pady=2,
+                          command=self._rotate_oscore_keys,
+                          **_SRV_BTN).pack(side=tk.LEFT, padx=(0, 4))
+                tk.Button(srv_btns, text="⟳ Rotate DTLS", padx=6, pady=2,
+                          command=self._rotate_dtls_keys,
+                          **_SRV_BTN).pack(side=tk.LEFT, padx=(0, 4))
 
             stat_row = tk.Frame(col, bg=PALETTE["BG2"])
             stat_row.pack(fill=tk.X, padx=6, pady=(0, 2))
@@ -532,6 +657,8 @@ class LogViewer(tk.Tk):
                           font=("monospace", 8))
             ps.pack(side=tk.LEFT)
             self._panel_status[src] = ps
+            if is_server:
+                self._server_branch_lbl = ps
 
             txt = scrolledtext.ScrolledText(
                 col, bg=PALETTE["BG"], fg=fg,
@@ -546,23 +673,26 @@ class LogViewer(tk.Tk):
             txt.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
             self._texts[src] = txt
 
-            inp_row = tk.Frame(col, bg=PALETTE["BG2"])
-            inp_row.pack(fill=tk.X, padx=2, pady=(0, 3))
-            entry = tk.Entry(
-                inp_row, bg=PALETTE["BG3"], fg=fg,
-                insertbackground=fg, relief=tk.FLAT,
-                font=("monospace", 9),
-            )
-            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2), ipady=3)
-            tk.Button(
-                inp_row, text="↵",
-                bg=PALETTE["BG3"], fg=fg,
-                activebackground="#30363d", relief=tk.FLAT,
-                padx=6, pady=2, font=("monospace", 9),
-                command=lambda s=src, e=entry: self._send_cmd(s, e),
-            ).pack(side=tk.LEFT)
-            entry.bind("<Return>", lambda event, s=src, e=entry: self._send_cmd(s, e))
-            self._cmd_entries[src] = entry
+            if is_server:
+                self._build_server_config(server_row)
+            else:
+                inp_row = tk.Frame(col, bg=PALETTE["BG2"])
+                inp_row.pack(fill=tk.X, padx=2, pady=(0, 3))
+                entry = tk.Entry(
+                    inp_row, bg=PALETTE["BG3"], fg=fg,
+                    insertbackground=fg, relief=tk.FLAT,
+                    font=("monospace", 9),
+                )
+                entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2), ipady=3)
+                tk.Button(
+                    inp_row, text="↵",
+                    bg=PALETTE["BG3"], fg=fg,
+                    activebackground="#30363d", relief=tk.FLAT,
+                    padx=6, pady=2, font=("monospace", 9),
+                    command=lambda s=src, e=entry: self._send_cmd(s, e),
+                ).pack(side=tk.LEFT)
+                entry.bind("<Return>", lambda event, s=src, e=entry: self._send_cmd(s, e))
+                self._cmd_entries[src] = entry
 
         # ── Device action bar — 3 columns aligned under log panels ──────────────
         # Tinted button styles per source
@@ -747,6 +877,13 @@ class LogViewer(tk.Tk):
 
         self._jlink_procs = spawn_jlink_servers(JLINK_SERVERS, self._q)
         self._start_rtt_readers()
+
+        threading.Thread(
+            target=ssh_log_reader,
+            args=("Server", SSH_SERVER_HOST, SSH_SERVER_CMD, self._q, self._stop),
+            daemon=True,
+        ).start()
+        self._fetch_server_branch()
 
         missing = [(src, quiet, reconnect_cb)
                    for src, port, quiet, reconnect_cb in serial_ports if not port]
@@ -985,7 +1122,7 @@ class LogViewer(tk.Tk):
     def _refresh_all(self):
         self._clear_all()
         self._status.configure(text="Refreshing…")
-        self._resetting_sources.update(SOURCES)
+        self._resetting_sources.update(_DEVICE_SOURCES)
         # reset all via BLE shell (resets nRF9151 then reboots nRF5340)
         self._shell_cmd("BLE", "reset all")
         # reset Thingy:53 via nrfutil (no shell on Thingy:53)
@@ -998,6 +1135,359 @@ class LogViewer(tk.Tk):
             msg = f"53 reset {'OK' if ok else 'FAILED'}"
             self._q.put((_UI_, time.time(), lambda m=msg: self._status.configure(text=m)))
         threading.Thread(target=reset_53, daemon=True).start()
+
+    # ── Security config panel ─────────────────────────────────────────────────
+
+    def _build_server_config(self, parent: tk.Frame):
+        fg  = SOURCE_COLOR["Server"]
+        cfg = tk.Frame(parent, bg=PALETTE["BG2"])
+        cfg.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tk.Label(cfg, text="Configuration", fg=fg, bg=PALETTE["BG2"],
+                 font=("monospace", 11, "bold"),
+                 padx=8, pady=4).pack(anchor="w")
+        tk.Frame(cfg, bg=PALETTE["BG3"], height=1).pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        # ── CoAP section ──────────────────────────────────────────────────────
+        coap_sec = tk.Frame(cfg, bg=PALETTE["BG2"])
+        coap_sec.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Label(coap_sec, text="CoAP  (hub ↔ server)", fg=PALETTE["MUTE"],
+                 bg=PALETTE["BG2"], font=("monospace", 8)).pack(anchor="w")
+
+        cur_row = tk.Frame(coap_sec, bg=PALETTE["BG2"])
+        cur_row.pack(anchor="w", pady=(1, 3))
+        tk.Label(cur_row, text="Current:", fg=PALETTE["MUTE"], bg=PALETTE["BG2"],
+                 font=("monospace", 8)).pack(side=tk.LEFT)
+        self._coap_current_lbl = tk.Label(cur_row, text="—", fg=PALETTE["GRN"],
+                                          bg=PALETTE["BG2"],
+                                          font=("monospace", 8, "bold"))
+        self._coap_current_lbl.pack(side=tk.LEFT, padx=(4, 0))
+
+        radio_row = tk.Frame(coap_sec, bg=PALETTE["BG2"])
+        radio_row.pack(anchor="w")
+        for val, lbl in _COAP_LABELS:
+            tk.Radiobutton(
+                radio_row, text=lbl, variable=self._coap_mode_var, value=val,
+                fg=fg, bg=PALETTE["BG2"], selectcolor=PALETTE["BG3"],
+                activebackground=PALETTE["BG2"], activeforeground=fg,
+                font=("monospace", 9), bd=0,
+            ).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Frame(cfg, bg=PALETTE["BG3"], height=1).pack(fill=tk.X, padx=6, pady=4)
+
+        # ── BLE section ───────────────────────────────────────────────────────
+        ble_sec = tk.Frame(cfg, bg=PALETTE["BG2"])
+        ble_sec.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Label(ble_sec, text="BLE  (sensor → hub)", fg=PALETTE["MUTE"],
+                 bg=PALETTE["BG2"], font=("monospace", 8)).pack(anchor="w")
+
+        cur_row2 = tk.Frame(ble_sec, bg=PALETTE["BG2"])
+        cur_row2.pack(anchor="w", pady=(1, 3))
+        tk.Label(cur_row2, text="Current:", fg=PALETTE["MUTE"], bg=PALETTE["BG2"],
+                 font=("monospace", 8)).pack(side=tk.LEFT)
+        self._ble_current_lbl = tk.Label(cur_row2, text="—", fg=PALETTE["GRN"],
+                                         bg=PALETTE["BG2"],
+                                         font=("monospace", 8, "bold"))
+        self._ble_current_lbl.pack(side=tk.LEFT, padx=(4, 0))
+
+        ble_r1 = tk.Frame(ble_sec, bg=PALETTE["BG2"])
+        ble_r1.pack(anchor="w")
+        for val, lbl in _BLE_LABELS[:3]:
+            tk.Radiobutton(
+                ble_r1, text=lbl, variable=self._ble_mode_var, value=val,
+                fg=fg, bg=PALETTE["BG2"], selectcolor=PALETTE["BG3"],
+                activebackground=PALETTE["BG2"], activeforeground=fg,
+                font=("monospace", 9), bd=0,
+            ).pack(side=tk.LEFT, padx=(0, 6))
+
+        ble_r2 = tk.Frame(ble_sec, bg=PALETTE["BG2"])
+        ble_r2.pack(anchor="w", pady=(2, 0))
+        for val, lbl in _BLE_LABELS[3:]:
+            tk.Radiobutton(
+                ble_r2, text=lbl, variable=self._ble_mode_var, value=val,
+                fg=fg, bg=PALETTE["BG2"], selectcolor=PALETTE["BG3"],
+                activebackground=PALETTE["BG2"], activeforeground=fg,
+                font=("monospace", 9), bd=0,
+            ).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Frame(cfg, bg=PALETTE["BG3"], height=1).pack(fill=tk.X, padx=6, pady=(4, 6))
+
+        # ── Apply button ──────────────────────────────────────────────────────
+        bottom = tk.Frame(cfg, bg=PALETTE["BG2"])
+        bottom.pack(fill=tk.X, padx=8, pady=(0, 6))
+        tk.Button(
+            bottom, text="Apply & Restart Server",
+            bg="#1a0d2e", fg=fg, activebackground="#2a1a42",
+            relief=tk.FLAT, padx=8, pady=4,
+            font=("monospace", 9),
+            command=self._apply_security_modes,
+        ).pack(side=tk.LEFT)
+        tk.Label(bottom,
+                 text="  Rebuild + reflash firmware to update hardware",
+                 fg=PALETTE["MUTE"], bg=PALETTE["BG2"],
+                 font=("monospace", 8)).pack(side=tk.LEFT)
+
+    def _update_mode_indicators(self):
+        coap_sel = self._coap_mode_var.get()
+        ble_sel  = self._ble_mode_var.get()
+
+        if self._coap_current_lbl:
+            human = dict(_COAP_LABELS).get(self._current_coap, self._current_coap)
+            if coap_sel != self._current_coap:
+                sel_h = dict(_COAP_LABELS).get(coap_sel, coap_sel)
+                self._coap_current_lbl.configure(
+                    text=f"{human}  →  {sel_h}", fg=SOURCE_COLOR["LTE"])
+            else:
+                self._coap_current_lbl.configure(text=human, fg=PALETTE["GRN"])
+
+        if self._ble_current_lbl:
+            human = dict(_BLE_LABELS).get(self._current_ble, self._current_ble)
+            if ble_sel != self._current_ble:
+                sel_h = dict(_BLE_LABELS).get(ble_sel, ble_sel)
+                self._ble_current_lbl.configure(
+                    text=f"{human}  →  {sel_h}", fg=SOURCE_COLOR["LTE"])
+            else:
+                self._ble_current_lbl.configure(text=human, fg=PALETTE["GRN"])
+
+    def _read_coap_mode(self) -> str:
+        conf = _LTE_APP / "local.conf"
+        if conf.exists():
+            m = _COAP_MODE_PAT.search(conf.read_text())
+            if m:
+                return m.group(1).lower()
+        return "oscore"
+
+    def _read_ble_mode(self) -> str:
+        conf = _SENS_APP / "local.conf"
+        if conf.exists():
+            m = _BLE_MODE_PAT.search(conf.read_text())
+            if m:
+                return m.group(1).lower()
+        return "gatt_oscore"
+
+    def _set_kconfig_mode(self, path: Path, prefix: str, new_line: str):
+        text = path.read_text() if path.exists() else ""
+        pat  = re.compile(rf"^{re.escape(prefix)}\w+=y", re.M)
+        if pat.search(text):
+            text = pat.sub(new_line, text)
+        else:
+            text = text.rstrip("\n") + "\n" + new_line + "\n"
+        path.write_text(text)
+
+    def _apply_security_modes(self):
+        def run():
+            coap = self._coap_mode_var.get()
+            ble  = self._ble_mode_var.get()
+            self._q.put(("Server", time.time(),
+                         f"[Applying: CoAP={coap}  BLE={ble}]", "status"))
+            try:
+                self._set_kconfig_mode(
+                    _LTE_APP / "local.conf",
+                    "CONFIG_APP_COAP_SECURITY_",
+                    f"CONFIG_APP_COAP_SECURITY_{coap.upper()}=y",
+                )
+                self._q.put(("Server", time.time(),
+                             f"  → hub LTE local.conf: COAP_SECURITY_{coap.upper()}", "build"))
+
+                self._set_kconfig_mode(
+                    _SENS_APP / "local.conf",
+                    "CONFIG_APP_BLE_SECURITY_",
+                    f"CONFIG_APP_BLE_SECURITY_{ble.upper()}=y",
+                )
+                self._q.put(("Server", time.time(),
+                             f"  → sensor local.conf: BLE_SECURITY_{ble.upper()}", "build"))
+
+                env_cmd = (
+                    f"python3 -c \""
+                    f"import re, pathlib; "
+                    f"p = pathlib.Path('/root/tracker-server/.env'); "
+                    f"t = p.read_text(); "
+                    f"t = re.sub(r'^SECURITY_MODE=.*', 'SECURITY_MODE={coap}', t, flags=re.M); "
+                    f"p.write_text(t)\""
+                )
+                subprocess.run(["ssh", "-o", "StrictHostKeyChecking=accept-new",
+                                SSH_SERVER_HOST, env_cmd], timeout=10)
+                self._q.put(("Server", time.time(),
+                             f"  → server .env: SECURITY_MODE={coap}", "build"))
+
+                self._ssh_restart_server()
+                self._q.put(("Server", time.time(),
+                             "[local.conf written, server restarted — rebuild+reflash firmware]",
+                             "status"))
+            except Exception as e:
+                self._q.put(("Server", time.time(), f"[apply error: {e}]", "status"))
+        threading.Thread(target=run, daemon=True).start()
+
+    # ── Server actions ────────────────────────────────────────────────────────
+
+    def _fetch_server_branch(self):
+        def run():
+            try:
+                result = subprocess.run(
+                    ["ssh",
+                     "-o", "StrictHostKeyChecking=accept-new",
+                     "-o", "ConnectTimeout=10",
+                     SSH_SERVER_HOST,
+                     "git -C ~/tracker-server fetch --quiet 2>&1;"
+                     " git -C ~/tracker-server status --short --branch 2>&1"],
+                    capture_output=True, text=True, timeout=20,
+                )
+                first = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+                branch = first.lstrip("# ").split("...")[0].strip() or "?"
+                if "[behind" in first:
+                    n = first.split("[behind")[1].split("]")[0].strip()
+                    label = f"branch: {branch}  ⚠ {n} behind"
+                    color = PALETTE["RED"]
+                elif "[ahead" in first:
+                    n = first.split("[ahead")[1].split("]")[0].strip()
+                    label = f"branch: {branch}  ↑ {n} ahead"
+                    color = SOURCE_COLOR["LTE"]
+                else:
+                    label = f"branch: {branch}  ✓ up to date"
+                    color = PALETTE["GRN"]
+            except Exception as e:
+                label = f"branch: (SSH error: {e})"
+                color = PALETTE["MUTE"]
+            self._q.put((_UI_, time.time(),
+                         lambda l=label, c=color:
+                         self._server_branch_lbl and
+                         self._server_branch_lbl.configure(text=l, fg=c)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _ssh_restart_server(self):
+        def run():
+            self._q.put(("Server", time.time(), "[Restarting coap-server…]", "status"))
+            try:
+                result = subprocess.run(
+                    ["ssh",
+                     "-o", "StrictHostKeyChecking=accept-new",
+                     "-o", "ConnectTimeout=10",
+                     SSH_SERVER_HOST,
+                     "cd tracker-server && docker compose restart coap-server 2>&1"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                ok = result.returncode == 0
+                for line in result.stdout.splitlines():
+                    if line.strip():
+                        self._q.put(("Server", time.time(), f"  {line}", "build"))
+                self._q.put(("Server", time.time(),
+                             f"[coap-server restart {'OK' if ok else 'FAILED'}]", "status"))
+                self._fetch_server_branch()
+            except Exception as e:
+                self._q.put(("Server", time.time(), f"[restart error: {e}]", "status"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rotate_oscore_keys(self):
+        def run():
+            self._q.put(("Server", time.time(), "[OSCORE key rotation started]", "status"))
+            try:
+                for name, conf_path in [("hub",    _LTE_APP  / "oscore.conf"),
+                                         ("sensor", _SENS_APP / "oscore.conf")]:
+                    self._q.put(("Server", time.time(),
+                                 f"[generate_oscore_psk.py --name {name}]", "build"))
+                    r = subprocess.run(
+                        ["ssh",
+                         "-o", "StrictHostKeyChecking=accept-new",
+                         "-o", "ConnectTimeout=10",
+                         SSH_SERVER_HOST,
+                         f"cd ~/tracker-server && python3 generate_oscore_psk.py --name {name} 2>&1"],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    for line in r.stdout.splitlines():
+                        self._q.put(("Server", time.time(), f"  {line}", "build"))
+                    if r.returncode != 0:
+                        self._q.put(("Server", time.time(),
+                                     f"[FAILED generating {name} context]", "status"))
+                        return
+                    conf_lines = [ln for ln in r.stdout.splitlines()
+                                  if ln.startswith("CONFIG_APP_OSCORE_")]
+                    conf_path.write_text("\n".join(conf_lines) + "\n")
+                    self._q.put(("Server", time.time(), f"  → wrote {conf_path}", "build"))
+
+                # Ensure OSCORE_CONTEXT_DIR is set to the in-container mount path
+                env_cmd = (
+                    "python3 -c \""
+                    "import re, pathlib; "
+                    "p = pathlib.Path('/root/tracker-server/.env'); "
+                    "t = p.read_text(); "
+                    "t = re.sub(r'^OSCORE_CONTEXT_DIR=.*', "
+                    "'OSCORE_CONTEXT_DIR=/app/oscore-context', t, flags=re.M); "
+                    "p.write_text(t)\""
+                )
+                subprocess.run(
+                    ["ssh", "-o", "StrictHostKeyChecking=accept-new",
+                     SSH_SERVER_HOST, env_cmd],
+                    timeout=10,
+                )
+                self._q.put(("Server", time.time(),
+                             "[.env: OSCORE_CONTEXT_DIR=/app/oscore-context]", "build"))
+                self._ssh_restart_server()
+                self._q.put(("Server", time.time(),
+                             "[OSCORE rotation done — rebuild + reflash hub and sensor]",
+                             "status"))
+            except Exception as e:
+                self._q.put(("Server", time.time(),
+                             f"[OSCORE rotation error: {e}]", "status"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rotate_dtls_keys(self):
+        def run():
+            self._q.put(("Server", time.time(), "[DTLS key rotation started]", "status"))
+            try:
+                r = subprocess.run(
+                    ["ssh",
+                     "-o", "StrictHostKeyChecking=accept-new",
+                     "-o", "ConnectTimeout=10",
+                     SSH_SERVER_HOST,
+                     "cd ~/tracker-server && python3 generate_dtls_psk.py 2>&1"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                for line in r.stdout.splitlines():
+                    self._q.put(("Server", time.time(), f"  {line}", "build"))
+                if r.returncode != 0:
+                    self._q.put(("Server", time.time(), "[DTLS gen FAILED]", "status"))
+                    return
+
+                conf_lines = [ln for ln in r.stdout.splitlines()
+                              if ln.startswith("CONFIG_APP_DTLS_")]
+                dtls_conf = _LTE_APP / "dtls.conf"
+                dtls_conf.write_text("\n".join(conf_lines) + "\n")
+                self._q.put(("Server", time.time(), f"  → wrote {dtls_conf}", "build"))
+
+                env_vals = {}
+                for ln in r.stdout.splitlines():
+                    if ln.startswith("DTLS_PSK_IDENTITY=") or ln.startswith("DTLS_PSK_KEY_HEX="):
+                        k, v = ln.split("=", 1)
+                        env_vals[k] = v
+
+                if env_vals:
+                    subs = "; ".join(
+                        f"t = re.sub(r'^{k}=.*', r'{k}={v}', t, flags=re.M)"
+                        for k, v in env_vals.items()
+                    )
+                    env_cmd = (
+                        f"python3 -c \""
+                        f"import re, pathlib; "
+                        f"p = pathlib.Path('/root/tracker-server/.env'); "
+                        f"t = p.read_text(); "
+                        f"{subs}; "
+                        f"p.write_text(t)\""
+                    )
+                    subprocess.run(
+                        ["ssh", "-o", "StrictHostKeyChecking=accept-new",
+                         SSH_SERVER_HOST, env_cmd],
+                        timeout=10,
+                    )
+                    self._q.put(("Server", time.time(),
+                                 "[.env updated with new DTLS PSK]", "build"))
+
+                self._ssh_restart_server()
+                self._q.put(("Server", time.time(),
+                             "[DTLS rotation done — rebuild + reflash hub]", "status"))
+            except Exception as e:
+                self._q.put(("Server", time.time(),
+                             f"[DTLS rotation error: {e}]", "status"))
+        threading.Thread(target=run, daemon=True).start()
 
     # ── Device actions ────────────────────────────────────────────────────────
 
@@ -1090,6 +1580,12 @@ class LogViewer(tk.Tk):
                         self._q.put((p, time.time(), f"[Flash {'OK' if ok else 'FAILED'}]", "status"))
                         self._q.put((_UI_, time.time(), lambda p=p, t=txt, o=ok:
                                      self._set_panel_status(p, t, o)))
+                    if ok:
+                        if key == "lte":
+                            self._current_coap = self._coap_mode_var.get()
+                        elif key == "sensor":
+                            self._current_ble = self._ble_mode_var.get()
+                        self._q.put((_UI_, time.time(), self._update_mode_indicators))
                     if key == "sensor":
                         self._q.put((_UI_, time.time(), self._respawn_jlink))
 
@@ -1166,6 +1662,12 @@ class LogViewer(tk.Tk):
                                      f"[Flash {'OK' if ok2 else 'FAILED'}]", "status"))
                         self._q.put((_UI_, time.time(), lambda p=p, t=txt, o=ok2:
                                      self._set_panel_status(p, t, o)))
+                    if ok2:
+                        if key == "lte":
+                            self._current_coap = self._coap_mode_var.get()
+                        elif key == "sensor":
+                            self._current_ble = self._ble_mode_var.get()
+                        self._q.put((_UI_, time.time(), self._update_mode_indicators))
                     if key == "sensor":
                         self._q.put((_UI_, time.time(), self._respawn_jlink))
 
@@ -1249,12 +1751,8 @@ class LogViewer(tk.Tk):
         self._all_lines[source] = []
 
     def _clear_all(self):
-        for src, txt in self._texts.items():
-            txt.configure(state=tk.NORMAL)
-            txt.delete("1.0", tk.END)
-            txt.configure(state=tk.DISABLED)
-            self._line_count[src] = 0
-            self._all_lines[src] = []
+        for src in _DEVICE_SOURCES:
+            self._clear_source(src)
 
     # ── Close ─────────────────────────────────────────────────────────────────
 

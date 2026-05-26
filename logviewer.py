@@ -104,6 +104,7 @@ TARGETS = {
             "-b", "thingy91x/nrf5340/cpuapp",
             "--build-dir", str(_BLE_BLD),
             str(_BLE_APP),
+            "--sysbuild",
         ],
         "optional_conf": _BLE_APP / "local.conf",
         # Recover Application core before programming (clears ERASEPROTECT/APPROTECT).

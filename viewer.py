@@ -185,6 +185,16 @@ class LogViewer(tk.Tk):
                     b.pack(side=tk.LEFT, padx=1)
                     self._tab_btns[src][tab_key] = b
 
+            if is_events:
+                ev_btns = tk.Frame(col, bg=PALETTE["BG2"])
+                ev_btns.pack(fill=tk.X, padx=4, pady=(0, 2))
+                tk.Button(ev_btns, text="Clear", padx=6, pady=2,
+                          bg=PALETTE["BG3"], fg=fg,
+                          activebackground="#30363d", relief=tk.FLAT,
+                          font=("monospace", 9),
+                          command=lambda: self._clear_source("Events"),
+                          ).pack(side=tk.LEFT)
+
             if is_server:
                 srv_btns = tk.Frame(col, bg=PALETTE["BG2"])
                 srv_btns.pack(fill=tk.X, padx=4, pady=(0, 2))
@@ -226,9 +236,7 @@ class LogViewer(tk.Tk):
             txt.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
             self._texts[src] = txt
 
-            if is_server:
-                self._build_server_config(server_row)
-            elif not is_events:
+            if not is_server and not is_events:
                 inp_row = tk.Frame(col, bg=PALETTE["BG2"])
                 inp_row.pack(fill=tk.X, padx=2, pady=(0, 3))
                 entry = tk.Entry(

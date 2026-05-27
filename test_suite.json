@@ -1,0 +1,25 @@
+{
+  "name": "OSCORE Recheck",
+  "scenarios": [
+    {
+      "ble": "gatt_oscore",
+      "coap": "oscore",
+      "comment": "OSCORE E2E only"
+    },
+    {
+      "ble": "gatt_oscore",
+      "coap": "dtls_oscore",
+      "comment": "DTLS + OSCORE E2E"
+    },
+    {
+      "ble": "broadcast_oscore",
+      "coap": "oscore",
+      "comment": "Broadcast OSCORE E2E"
+    },
+    {
+      "ble": "broadcast_oscore",
+      "coap": "dtls_oscore",
+      "comment": "Broadcast DTLS + OSCORE E2E"
+    }
+  ]
+}

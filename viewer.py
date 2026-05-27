@@ -29,6 +29,7 @@ from ui_constants import (
     _UI_, LOG_LEVEL_COLOR,
     _COAP_LABELS, _BLE_LABELS, _COAP_MODE_PAT, _BLE_MODE_PAT,
     _OSCORE_BLE_MODES, _OSCORE_COAP_MODES, _HUB_BLE_RELAY_FLAGS,
+    _EVENT_PATTERNS,
     _dev_tag,
 )
 from utils import _dbg, _stream_action
@@ -39,10 +40,14 @@ class LogViewer(tk.Tk):
     def __init__(self, ble_port, lte_port, sensor_port):
         super().__init__()
         self.title("Tracker Dev Console")
-        self.geometry("1800x980")
         self.configure(bg=PALETTE["BG"])
-        self.after(0, lambda: self.state("zoomed") if sys.platform == "win32"
-                   else self.attributes("-zoomed", True))
+        self.update_idletasks()
+        if sys.platform == "win32":
+            self.state("zoomed")
+        else:
+            w, h = self.winfo_screenwidth(), self.winfo_screenheight()
+            self.geometry(f"{w}x{h}+0+0")
+            self.attributes("-zoomed", True)
 
         self._q           = queue.Queue()
         self._stop        = threading.Event()
@@ -87,6 +92,17 @@ class LogViewer(tk.Tk):
         self._ble_current_lbl:  tk.Label | None = None
         self._build_conf_labels: dict[str, list[tuple[tk.Label, Path]]] = {}
         self._coap_radios: list[tuple[str, tk.Radiobutton]] = []
+        # log watchers: background threads can wait for a pattern in a panel
+        self._log_watchers: list = []   # [(source, pattern, threading.Event)]
+        self._log_watcher_mu = threading.Lock()
+        # test-run state
+        self._test_running           = False
+        self._test_run_btn:    tk.Button | None = None
+        self._test_status_lbl: tk.Label | None = None
+        self._test_mode_lbl:   tk.Label | None = None
+        self._wrong_dtls_var         = tk.BooleanVar(value=False)
+        self._wrong_oscore_hub_var   = tk.BooleanVar(value=False)
+        self._wrong_oscore_sensor_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         # initialise mode selectors from local.conf
@@ -97,8 +113,11 @@ class LogViewer(tk.Tk):
         self._coap_mode_var.set(c)
         self._ble_mode_var.set(b)
         self._on_ble_mode_changed()   # sets initial radio states + indicators
-        self._coap_mode_var.trace_add("write", lambda *_: self._update_mode_indicators())
-        self._ble_mode_var.trace_add("write",  lambda *_: self._on_ble_mode_changed())
+        self._update_test_mode_label()
+        self._coap_mode_var.trace_add("write", lambda *_: (self._update_mode_indicators(),
+                                                            self._update_test_mode_label()))
+        self._ble_mode_var.trace_add("write",  lambda *_: (self._on_ble_mode_changed(),
+                                                            self._update_test_mode_label()))
         self._refresh_build_conf_display()
 
         self._launch(ble_port, lte_port, sensor_port)
@@ -120,13 +139,17 @@ class LogViewer(tk.Tk):
         for src in SOURCES:
             fg        = SOURCE_COLOR[src]
             is_server = (src == "Server")
+            is_events = (src == "Events")
 
             if is_server:
                 server_row = tk.Frame(panels_frame, bg=PALETTE["BG"])
-                server_row.grid(row=0, column=0, columnspan=3, sticky="nsew",
+                server_row.grid(row=0, column=0, columnspan=4, sticky="nsew",
                                 padx=3, pady=(0, 3))
                 col = tk.Frame(server_row, bg=PALETTE["BG2"])
                 col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 2))
+            elif is_events:
+                col = tk.Frame(server_row, bg=PALETTE["BG2"])
+                col.pack(side=tk.LEFT, fill=tk.BOTH, padx=(2, 0))
             else:
                 dev_idx = _DEVICE_SOURCES.index(src)
                 col = tk.Frame(panels_frame, bg=PALETTE["BG2"])
@@ -146,7 +169,7 @@ class LogViewer(tk.Tk):
             ).pack(side=tk.RIGHT)
 
             self._tab_btns[src] = {}
-            if not is_server:
+            if not is_server and not is_events:
                 tab_frame = tk.Frame(hdr, bg=PALETTE["BG2"])
                 tab_frame.pack(side=tk.RIGHT, padx=(4, 0))
                 for tab_label, tab_key in [("UART", "uart"), ("Build", "build"), ("Both", "both")]:
@@ -205,7 +228,7 @@ class LogViewer(tk.Tk):
 
             if is_server:
                 self._build_server_config(server_row)
-            else:
+            elif not is_events:
                 inp_row = tk.Frame(col, bg=PALETTE["BG2"])
                 inp_row.pack(fill=tk.X, padx=2, pady=(0, 3))
                 entry = tk.Entry(
@@ -292,6 +315,60 @@ class LogViewer(tk.Tk):
         cbtn(sens_r1, "Build & Flash",          lambda: self._do_build_and_flash("sensor"),                "sensor", "Thingy53")
         cbtn(sens_r1, "Build Pristine & Flash", lambda: self._do_build_and_flash("sensor", pristine=True), "sensor", "Thingy53")
 
+        # ── Test run bar ─────────────────────────────────────────────────────
+        test_bar = tk.Frame(self, bg=PALETTE["BG"], pady=2)
+        test_bar.pack(fill=tk.X, padx=6, pady=(0, 2))
+
+        tk.Label(test_bar, text="Run Test:", fg=PALETTE["MUTE"], bg=PALETTE["BG"],
+                 font=("monospace", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._test_mode_lbl = tk.Label(
+            test_bar, text="…", fg=PALETTE["FG"], bg=PALETTE["BG"],
+            font=("monospace", 9))
+        self._test_mode_lbl.pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Frame(test_bar, bg=PALETTE["MUTE"], width=1, height=16).pack(
+            side=tk.LEFT, padx=(0, 8), fill=tk.Y)
+
+        for chk_text, chk_var in [
+            ("Wrong DTLS",         self._wrong_dtls_var),
+            ("Wrong OSCORE (hub)", self._wrong_oscore_hub_var),
+            ("Wrong OSCORE (sens)", self._wrong_oscore_sensor_var),
+        ]:
+            tk.Checkbutton(
+                test_bar, text=chk_text, variable=chk_var,
+                fg=PALETTE["RED"], bg=PALETTE["BG"],
+                selectcolor=PALETTE["BG3"],
+                activebackground=PALETTE["BG"],
+                font=("monospace", 9), bd=0,
+            ).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Frame(test_bar, bg=PALETTE["MUTE"], width=1, height=16).pack(
+            side=tk.LEFT, padx=(0, 8), fill=tk.Y)
+
+        self._test_run_btn = tk.Button(
+            test_bar, text="▶ Run Test",
+            bg="#162a18", fg=SOURCE_COLOR["Thingy53"],
+            activebackground="#1e3820", relief=tk.FLAT,
+            padx=10, pady=3, font=("monospace", 9, "bold"),
+            command=self._run_test,
+        )
+        self._test_run_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._suite_run_btn = tk.Button(
+            test_bar, text="▶ Suite",
+            bg="#1a1a2e", fg="#9ECBFF",
+            activebackground="#22223a", relief=tk.FLAT,
+            padx=8, pady=3, font=("monospace", 9, "bold"),
+            command=self._run_suite,
+        )
+        self._suite_run_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self._test_status_lbl = tk.Label(
+            test_bar, text="", fg=PALETTE["MUTE"], bg=PALETTE["BG"],
+            font=("monospace", 9))
+        self._test_status_lbl.pack(side=tk.LEFT)
+
         # ── Bottom bar ───────────────────────────────────────────────────────
         bar = tk.Frame(self, bg=PALETTE["BG"], pady=4)
         bar.pack(fill=tk.X, padx=6, pady=(0, 6))
@@ -338,6 +415,13 @@ class LogViewer(tk.Tk):
             activebackground="#30363d", relief=tk.FLAT,
             padx=8, pady=5,
             command=lambda: self._do_reset(SNR_SENSOR, "53", ["Thingy53"]),
+        ).pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(
+            bar, text="📍 Location",
+            bg=PALETTE["BG3"], fg=SOURCE_COLOR["LTE"],
+            activebackground="#30363d", relief=tk.FLAT,
+            padx=8, pady=5, command=self._trigger_location,
         ).pack(side=tk.LEFT, padx=(0, 12))
 
         tk.Frame(bar, bg=PALETTE["MUTE"], width=1, height=24).pack(
@@ -518,6 +602,471 @@ class LogViewer(tk.Tk):
             ])
             self._csv_file.flush()
 
+        if source != "Events":
+            for pat, label in _EVENT_PATTERNS:
+                if pat.search(msg):
+                    self._emit_event(f"[{source}] {label}")
+                    break
+            with self._log_watcher_mu:
+                for wsrc, wpat, wev in self._log_watchers:
+                    if wsrc == source and wpat.search(msg):
+                        wev.set()
+
+    def _emit_event(self, msg: str):
+        self._q.put(("Events", time.time(), msg, "status"))
+
+    def _register_log_watcher(self, source: str, pattern) -> threading.Event:
+        """Register a watcher immediately and return its Event.
+        Call this before starting the wait so events that fire early are not missed."""
+        import re as _re
+        if isinstance(pattern, str):
+            pattern = _re.compile(pattern)
+        ev = threading.Event()
+        with self._log_watcher_mu:
+            self._log_watchers.append((source, pattern, ev))
+        return ev
+
+    def _finish_log_watcher(self, ev: threading.Event, timeout: float) -> bool:
+        """Wait for a previously registered watcher event. Removes it when done."""
+        try:
+            return ev.wait(timeout)
+        finally:
+            with self._log_watcher_mu:
+                self._log_watchers[:] = [w for w in self._log_watchers if w[2] is not ev]
+
+    def _wait_for_log(self, source: str, pattern, timeout: float) -> bool:
+        """Register watcher and block until *pattern* appears, or *timeout* expires."""
+        ev = self._register_log_watcher(source, pattern)
+        return self._finish_log_watcher(ev, timeout)
+
+    def _update_test_mode_label(self):
+        if self._test_mode_lbl:
+            b = self._ble_mode_var.get()
+            c = self._coap_mode_var.get()
+            self._test_mode_lbl.config(text=f"{b} + {c}")
+
+    def _run_test(self):
+        if self._test_running:
+            return
+        ble  = self._ble_mode_var.get()
+        coap = self._coap_mode_var.get()
+        wrong = frozenset(filter(None, [
+            "wrong_dtls"          if self._wrong_dtls_var.get()          else None,
+            "wrong_oscore_hub"    if self._wrong_oscore_hub_var.get()    else None,
+            "wrong_oscore_sensor" if self._wrong_oscore_sensor_var.get() else None,
+        ]))
+        self._test_running = True
+        self._test_run_btn.config(state=tk.DISABLED, text="● Running…")
+        self._test_status_lbl.config(text="starting…")
+        self._emit_event(f"Test started: {ble} + {coap}")
+
+        def _run():
+            try:
+                self._run_test_thread(ble, coap, wrong)
+            except Exception as e:
+                self._emit_event(f"Test ERROR: {e}")
+            finally:
+                self._test_running = False
+                self.after(0, lambda: (
+                    self._test_run_btn.config(state=tk.NORMAL, text="▶ Run Test"),
+                    self._test_status_lbl.config(text=""),
+                ))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _run_test_thread(self, ble_mode: str, coap_mode: str, wrong_flags: frozenset):
+        import sys as _sys
+        _here = Path(__file__).parent.resolve()
+        if str(_here) not in _sys.path:
+            _sys.path.insert(0, str(_here))
+
+        import runtest as _rt
+
+        def _status(msg: str):
+            self._test_status_lbl.config(text=msg)
+            self._emit_event(msg)
+
+        log = _rt.EventLog()
+
+        # Validate pairing
+        from ui_constants import _OSCORE_BLE_MODES, _OSCORE_COAP_MODES
+        if (ble_mode in _OSCORE_BLE_MODES) != (coap_mode in _OSCORE_COAP_MODES):
+            _status("Invalid pairing — BLE/CoAP OSCORE mismatch")
+            return
+
+        run_dir = _rt.RunDir(ble_mode, coap_mode, wrong_flags)
+        label   = f"{ble_mode} + {coap_mode}"
+        if wrong_flags:
+            label += f"  [{', '.join(wrong_flags)}]"
+        log.log(f"TEST: {label}")
+        log.log(f"Results → testruns/{run_dir.path.name}")
+        t_start = time.time()
+
+        # Load state for smart sensor rebuild
+        state           = _rt._load_state()
+        last_ble        = state.get("last_ble", "")
+        sensor_hash_old = state.get("sensor_conf_hash", "")
+
+        # Write configs
+        _status("writing configs…")
+        _rt._setup_configs(ble_mode, coap_mode, wrong_flags, log)
+        sensor_hash_new = _rt._conf_hash(_rt._SENS_APP / "security.conf")
+        rebuild_sensor  = (ble_mode != last_ble) or (sensor_hash_new != sensor_hash_old)
+
+        # Snapshot configs
+        from build_config import _BLE_APP, _SENS_APP
+        for src, dst in [
+            (_BLE_APP  / "security.conf", "ble_security.conf"),
+            (_SENS_APP / "security.conf", "sensor_security.conf"),
+        ]:
+            if src.exists():
+                run_dir.config_path(dst).write_bytes(src.read_bytes())
+
+        # Update server env
+        _rt._ssh_update_env("SECURITY_MODE", coap_mode)
+
+        # Phase 1: Reset LTE via write queue, parallel build + server restart
+        _status("reset LTE…")
+        log.log("BLE→LTE: sending reset lte via logviewer write queue")
+        self._write_queues["BLE"].put(b"reset lte\r\n")
+        time.sleep(0.5)
+
+        def _stream_build(key: str, pristine: bool = True) -> bool:
+            tgt  = TARGETS[key]
+            cmd  = NRFUTIL_WRAP + _effective_build_cmd(tgt)
+            if pristine:
+                wi  = cmd.index("west")
+                cmd = cmd[:wi + 2] + ["--pristine"] + cmd[wi + 2:]
+            ok_box = [False]
+            _stream_action(
+                f"build {key}", tgt["panels"], tgt["cwd"], cmd, self._q,
+                done_cb=lambda ok: ok_box.__setitem__(0, ok),
+            )
+            if ok_box[0]:
+                self._emit_event(f"{tgt['label']}: build complete")
+            return ok_box[0]
+
+        def _stream_flash(key: str) -> bool:
+            tgt    = TARGETS[key]
+            snr    = tgt.get("snr")
+            panels = tgt["panels"]
+            if snr and not self._snr_try_acquire(snr, panels):
+                log.log(f"Flash blocked — programmer {snr} busy")
+                return False
+            try:
+                for pre_cmd in tgt.get("pre_flash_cmds", []):
+                    r = subprocess.run(pre_cmd, capture_output=True, text=True)
+                    if r.returncode != 0:
+                        msg = r.stderr.strip() or r.stdout.strip()
+                        for p in panels:
+                            self._q.put((p, time.time(), f"[pre-flash failed: {msg}]", "build"))
+                        return False
+                flash_cmd = NRFUTIL_WRAP + tgt["flash_cmd"]
+                ok_box = [False]
+                _stream_action(
+                    f"flash {key}", panels, tgt["cwd"], flash_cmd, self._q,
+                    done_cb=lambda ok: ok_box.__setitem__(0, ok),
+                )
+                if ok_box[0]:
+                    self._emit_event(f"{tgt['label']}: flashed")
+                return ok_box[0]
+            finally:
+                if snr:
+                    self._snr_release(snr)
+
+        build_ok: dict[str, bool] = {}
+
+        def _do_build_ble():
+            build_ok["ble"] = _stream_build("ble", pristine=True)
+
+        def _do_build_sensor():
+            build_ok["sensor"] = _stream_build("sensor", pristine=True)
+
+        def _do_restart_server():
+            build_ok["server"] = _rt._ssh_restart_server(log)
+
+        build_threads = [threading.Thread(target=_do_build_ble, daemon=True)]
+        if rebuild_sensor:
+            log.log(f"Sensor: rebuild (BLE mode {last_ble!r} → {ble_mode!r} or config changed)")
+            build_threads.append(threading.Thread(target=_do_build_sensor, daemon=True))
+        else:
+            build_ok["sensor"] = True
+            log.log("Sensor: skipping rebuild (unchanged)")
+        build_threads.append(threading.Thread(target=_do_restart_server, daemon=True))
+
+        _status("building…")
+        for t in build_threads:
+            t.start()
+
+        log.log(f"Waiting {_rt._WAIT_LTE_REBOOT} s for LTE reboot while builds run…")
+        time.sleep(_rt._WAIT_LTE_REBOOT)
+
+        for t in build_threads:
+            t.join()
+
+        if not build_ok.get("ble"):
+            _status("BLE build FAILED")
+            log.log("BLE build FAILED — aborting")
+            run_dir.write_timeline(log)
+            return
+        if not build_ok.get("sensor"):
+            _status("Sensor build FAILED")
+            log.log("Sensor build FAILED — aborting")
+            run_dir.write_timeline(log)
+            return
+
+        # Phase 2: Flash
+        import re as _re
+        gatt_mode = ble_mode in ("gatt", "lesc", "gatt_oscore")
+
+        if rebuild_sensor:
+            _status("flashing sensor…")
+            if not _stream_flash("sensor"):
+                _status("Sensor flash FAILED")
+                run_dir.write_timeline(log)
+                return
+
+        _status("flashing BLE…")
+        if not _stream_flash("ble"):
+            _status("BLE flash FAILED")
+            run_dir.write_timeline(log)
+            return
+
+        _rt._print_ble_ready(ble_mode, coap_mode, log)
+        self._emit_event(f"BLE flashed ({ble_mode} / {coap_mode})")
+
+        # Phase 3: Event-driven readiness gates
+        # Register ALL watchers before blocking on any of them so that events
+        # arriving before a later wait is reached are not missed.
+        import re as _re
+        _ev_ble = self._register_log_watcher(
+            "BLE", _re.compile(r"BLE scan active|BLE scan started"))
+        _ev_lte = self._register_log_watcher(
+            "LTE", _re.compile(r"Connected to Cloud|Custom CoAP connection successful"))
+        _ev_sensor = self._register_log_watcher(
+            "Thingy53", _re.compile(r"Hub connected")) if gatt_mode else None
+
+        # 3a: BLE scan active
+        _status("waiting: BLE scan active…")
+        log.log("Waiting for BLE: scan active (up to 30 s)…")
+        ble_ready = self._finish_log_watcher(_ev_ble, 30)
+        if ble_ready:
+            log.log("BLE: scan active — hub is searching for sensor")
+            self._emit_event("BLE: scan active")
+        else:
+            log.log("WARNING: BLE scan active not seen within 30 s (continuing)")
+
+        # 3b: LTE connected to cloud
+        _status("waiting: LTE connected to cloud…")
+        log.log("Waiting for LTE: Connected to Cloud (up to 90 s)…")
+        lte_ready = self._finish_log_watcher(_ev_lte, 90)
+        if lte_ready:
+            log.log("LTE: connected to cloud")
+            self._emit_event("LTE: connected to cloud")
+        else:
+            log.log("WARNING: LTE cloud connection not seen within 90 s (continuing)")
+            self._emit_event("WARNING: LTE cloud connection timeout")
+
+        # 3c: For GATT modes, wait for sensor to connect to hub
+        if gatt_mode:
+            _status("waiting: sensor connected to hub…")
+            log.log("Waiting for sensor BLE connection (up to 60 s)…")
+            sensor_conn = self._finish_log_watcher(_ev_sensor, 60)
+            if sensor_conn:
+                log.log("Sensor: hub connected")
+                self._emit_event("Sensor: hub connected")
+            else:
+                log.log("WARNING: sensor BLE connection not seen within 60 s (continuing)")
+                self._emit_event("WARNING: sensor BLE connection timeout")
+
+        # Print server context now that everything is up
+        _rt._print_server_ready(log)
+        env = _rt._ssh_read_env()
+        run_dir.config_path("server_env.txt").write_text(
+            "\n".join(f"{k}={v}" for k, v in sorted(env.items())), encoding="utf-8"
+        )
+
+        # Phase 4: Trigger location + sampling
+        # Watch LTE logs directly — faster than SSH polling, no case-sensitivity issues.
+        #   env_seen:      OSCORE modes: "OSCORE relay.*queued" (hub relays raw encrypted bytes)
+        #                  plain modes:  "BLE env"              (hub decodes and logs env values)
+        #   location_seen: "location: Wi-Fi" → location module started WiFi scan
+        #   coap_ok:       "CoAP response"   → server acknowledged at least one payload (2.04)
+        env_pat = r"OSCORE relay.*forwarded to server" if ble_mode in _OSCORE_BLE_MODES else r"BLE env\b"
+        _ev_env      = self._register_log_watcher("LTE", env_pat)
+        _ev_location = self._register_log_watcher("LTE", r"location: Wi-Fi")
+        _ev_coap_ok  = self._register_log_watcher("LTE", r"CoAP response")
+
+        _status("triggering location search…")
+        log.log("BLE: sending att_location search → nRF9151 IPC")
+        self._write_queues["BLE"].put(b"att_location search\r\n")
+        self._emit_event("BLE: att_location search sent")
+
+        _status("triggering att_sample…")
+        log.log("Sensor: sending att_sample via logviewer write queue")
+        self._write_queues["Thingy53"].put(b"att_sample\r\n")
+
+        _status("waiting: LTE received Thingy53 data…")
+        env_seen = self._finish_log_watcher(_ev_env, 30)
+        if env_seen:
+            log.log("LTE: Thingy53 env data received ✓")
+            self._emit_event("LTE: Thingy53 env received")
+        else:
+            log.log("WARNING: Thingy53 env not seen at LTE within 30 s")
+            self._emit_event("WARNING: env timeout")
+
+        _status("waiting: LTE location search active…")
+        location_seen = self._finish_log_watcher(_ev_location, 30)
+        if location_seen:
+            log.log("LTE: location search started (Wi-Fi) ✓")
+            self._emit_event("LTE: location search active")
+        else:
+            log.log("WARNING: location search not seen in LTE within 30 s")
+            self._emit_event("WARNING: location timeout")
+
+        _status("waiting: LTE CoAP response from server…")
+        coap_ok = self._finish_log_watcher(_ev_coap_ok, 60)
+        if coap_ok:
+            log.log("LTE: CoAP response received (server acknowledged payload) ✓")
+            self._emit_event("LTE: CoAP response OK")
+        else:
+            log.log("WARNING: no CoAP response seen in LTE within 60 s")
+            self._emit_event("WARNING: CoAP response timeout")
+
+        # Phase 5: Fetch server logs for the record
+        elapsed = int(time.time() - t_start) + 5
+        r = _rt._ssh(
+            f"cd tracker-server && docker compose logs --since {elapsed}s coap-server 2>&1",
+            timeout=15,
+        )
+        server_log = r.stdout.strip()
+        run_dir.log_path("server.txt").write_text(server_log, encoding="utf-8")
+
+        # Server-side backstop: ReplayErrorWithEcho means server rejected the
+        # OSCORE payload even though the hub got 2.04 for the outer JSON batch.
+        if ble_mode in _OSCORE_BLE_MODES and "ReplayErrorWithEcho" in server_log:
+            log.log("WARNING: Server rejected OSCORE payload (ReplayErrorWithEcho) — sensor data not stored")
+            self._emit_event("WARNING: OSCORE replay rejected by server")
+            env_seen = False
+
+        # Determine pass/fail from event watchers
+        if wrong_flags:
+            passed = True
+            log.log("MANUAL CHECK — negative test: verify server logs show expected failure")
+        else:
+            passed = env_seen and location_seen and coap_ok
+
+        _rt._save_state({
+            "last_ble":         ble_mode,
+            "last_coap":        coap_mode,
+            "sensor_conf_hash": _rt._conf_hash(_SENS_APP / "security.conf"),
+            "ble_conf_hash":    _rt._conf_hash(_BLE_APP  / "security.conf"),
+        })
+
+        status_str = "✓ PASS" if passed else "✗ FAIL"
+        log.log(f"{status_str}  ({label})")
+        self._emit_event(f"Test {status_str}: {label}")
+
+        run_dir.write_info({
+            "timestamp":       datetime.now().isoformat(timespec="seconds"),
+            "ble_mode":        ble_mode,
+            "coap_mode":       coap_mode,
+            "wrong_flags":     list(wrong_flags),
+            "result":          "PASS" if passed else "FAIL",
+            "elapsed_seconds": round(time.time() - t_start, 1),
+            "rebuild_sensor":  rebuild_sensor,
+        })
+        run_dir.write_timeline(log)
+
+        # Save UART panel logs (BLE, LTE, Thingy53) so the test run is self-contained.
+        for src in ("BLE", "LTE", "Thingy53"):
+            lines = self._all_lines.get(src, [])
+            text = "".join(
+                f"{wall}  {msg}\n" for wall, msg, kind in lines if kind != "build"
+            )
+            run_dir.log_path(f"{src.lower().replace(':', '')}.txt").write_text(
+                text, encoding="utf-8"
+            )
+
+        _status(f"{status_str}  ({label})")
+        time.sleep(3)
+        return passed
+
+    def _run_suite(self):
+        """Load test_suite.json from the same directory and run all non-skipped scenarios."""
+        if self._test_running:
+            return
+        import json
+        suite_path = Path(__file__).parent / "test_suite.json"
+        if not suite_path.exists():
+            self._test_status_lbl.config(text="test_suite.json not found")
+            return
+        with open(suite_path) as f:
+            suite = json.load(f)
+        scenarios = [s for s in suite.get("scenarios", []) if not s.get("skip", False)]
+        if not scenarios:
+            self._test_status_lbl.config(text="no scenarios to run")
+            return
+        self._test_running = True
+        self._test_run_btn.config(state=tk.DISABLED)
+        self._suite_run_btn.config(state=tk.DISABLED, text="● Suite…")
+        threading.Thread(
+            target=self._run_suite_thread,
+            args=(scenarios, suite.get("name", "Suite")),
+            daemon=True,
+        ).start()
+
+    def _run_suite_thread(self, scenarios: list, suite_name: str):
+        import sys as _sys
+        _here = Path(__file__).parent.resolve()
+        if str(_here) not in _sys.path:
+            _sys.path.insert(0, str(_here))
+        import runtest as _rt
+
+        total        = len(scenarios)
+        passed_count = 0
+        self._emit_event(f"Suite started: {suite_name} ({total} scenarios)")
+
+        for i, s in enumerate(scenarios):
+            ble     = s["ble"]
+            coap    = s["coap"]
+            wrong   = frozenset(s.get("wrong",  []))
+            rotate  = s.get("rotate", [])
+            comment = s.get("comment", "")
+            label   = f"{ble} + {coap}" + (f"  ({comment})" if comment else "")
+
+            self._emit_event(f"Suite {i + 1}/{total}: {label}")
+            self.after(0, lambda n=i + 1, t=total:
+                self._suite_run_btn.config(text=f"● {n}/{t}"))
+
+            # Key rotation before the test, if requested
+            if "dtls" in rotate:
+                _rt._rotate_dtls_keys(_rt.EventLog())
+            oscore_targets = []
+            if "oscore_hub"    in rotate or "oscore_both" in rotate:
+                oscore_targets.append("hub")
+            if "oscore_sensor" in rotate or "oscore_both" in rotate:
+                oscore_targets.append("sensor")
+            if oscore_targets:
+                _rt._rotate_oscore_keys(oscore_targets, _rt.EventLog())
+
+            try:
+                passed = self._run_test_thread(ble, coap, wrong)
+                if passed:
+                    passed_count += 1
+            except Exception as e:
+                self._emit_event(f"Suite ERROR in {label}: {e}")
+
+        summary = f"{passed_count}/{total} PASSED"
+        self._emit_event(f"Suite complete: {suite_name} — {summary}")
+        color = "#4caf50" if passed_count == total else "#f44336"
+        self._test_running = False
+        self.after(0, lambda: (
+            self._test_run_btn.config(state=tk.NORMAL),
+            self._suite_run_btn.config(state=tk.NORMAL, text="▶ Suite"),
+            self._test_status_lbl.config(text=summary, fg=color),
+        ))
+
     def _switch_tab(self, source: str, tab: str):
         self._active_tab[source] = tab
         fg = SOURCE_COLOR[source]
@@ -635,16 +1184,25 @@ class LogViewer(tk.Tk):
         else:
             self._status.configure(text=f"{source} not connected")
 
+    def _trigger_location(self):
+        """Trigger location search via BLE shell → nRF9151 IPC."""
+        wq = self._write_queues.get("BLE")
+        if wq:
+            wq.put(b"att_location search\r\n")
+            self._emit_event("BLE: att_location search sent")
+
     def _reset_91x(self):
         """Reset the whole Thingy:91X via 'reset all' BLE shell command."""
         self._resetting_sources.update(["BLE", "LTE"])
         self._shell_cmd("BLE", "reset all")
+        self._emit_event("BLE: reset all sent")
 
     def _refresh_all(self):
         self._clear_all()
         self._status.configure(text="Refreshing…")
         self._resetting_sources.update(_DEVICE_SOURCES)
         self._shell_cmd("BLE", "reset all")
+        self._emit_event("Refresh triggered")
         def reset_53():
             result = subprocess.run(
                 ["nrfutil", "device", "reset", "--serial-number", SNR_SENSOR],
@@ -876,8 +1434,8 @@ class LogViewer(tk.Tk):
         text = path.read_text() if path.exists() else ""
         pat  = re.compile(rf"^{re.escape(key)}=.*\n?", re.M)
         text = pat.sub("", text)
-        if value:
-            text = text.rstrip("\n") + f"\n{key}=y\n"
+        # Always write the explicit state so prj.conf defaults are overridden.
+        text = text.rstrip("\n") + f"\n{key}={'y' if value else 'n'}\n"
         path.write_text(text)
 
     def _apply_coap_mode(self):
@@ -913,6 +1471,7 @@ class LogViewer(tk.Tk):
                     self._current_coap = coap
                     self._update_mode_indicators()
                     self._shell_cmd("BLE", f"coap_mode {coap}")
+                    self._emit_event(f"CoAP mode → {coap}")
 
                 self._q.put((_UI_, time.time(), after_apply))
                 self._q.put(("Server", time.time(),
@@ -923,6 +1482,7 @@ class LogViewer(tk.Tk):
 
     def _apply_ble_mode(self):
         ble = self._ble_mode_var.get()
+        self._emit_event(f"BLE mode → {ble}")
         self._q.put(("Thingy53", time.time(),
                      f"[Applying BLE mode: {ble} — sensor + hub BLE reflash]", "status"))
         self._set_kconfig_mode(
@@ -1239,6 +1799,8 @@ class LogViewer(tk.Tk):
             for p in tgt["panels"]:
                 self._q.put((p, time.time(),
                              f"[{build_lbl} {'OK' if ok else 'FAILED'}]", "status"))
+            if ok:
+                self._emit_event(f"{lbl}: build complete")
             if not ok:
                 _ui(f"{lbl} build FAILED — flash skipped")
                 for p in tgt["panels"]:
@@ -1288,6 +1850,7 @@ class LogViewer(tk.Tk):
                         self._q.put((_UI_, time.time(), lambda p=p, t=txt, o=ok2:
                                      self._set_panel_status(p, t, o)))
                     if ok2:
+                        self._emit_event(f"{lbl}: flashed")
                         if key == "ble":
                             self._current_coap = self._coap_mode_var.get()
                         elif key == "sensor":

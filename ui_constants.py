@@ -10,7 +10,7 @@ import re
 # ── Panel / source names ─────────────────────────────────────────────────────────
 
 BAUD            = 115200
-SOURCES         = ["BLE", "LTE", "Thingy53", "Server"]
+SOURCES         = ["BLE", "LTE", "Thingy53", "Server", "Events"]
 _DEVICE_SOURCES = ["BLE", "LTE", "Thingy53"]
 
 # Sentinel: queue item whose payload[2] is a callable to run on the main thread.
@@ -33,6 +33,7 @@ SOURCE_COLOR = {
     "LTE":      "#e6a817",
     "Thingy53": "#57ab5a",
     "Server":   "#a371f7",
+    "Events":   "#9ecbff",
 }
 
 _RESET_LABEL = {
@@ -86,6 +87,24 @@ _HUB_BLE_RELAY_FLAGS: dict[str, dict[str, bool]] = {
     "gatt_oscore":      {"CONFIG_APP_SENSOR_RELAY_OSCORE":    True},
     "broadcast_oscore": {"CONFIG_APP_SENSOR_RELAY_OSCORE":    True},
 }
+
+# ── Event pattern matching ────────────────────────────────────────────────────────
+# Patterns matched against log lines from any device source to auto-emit structured
+# milestones into the Events panel. Used by both viewer.py and runtest.py.
+
+_EVENT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\*\*\* Booting"),                          "rebooted"),
+    (re.compile(r"Security config sent to nRF9151"),         "BLE: security_config sent"),
+    (re.compile(r"security_config: mode="),                  "LTE: security_config received"),
+    (re.compile(r"[Nn]etwork connected"),                    "LTE: network connected"),
+    (re.compile(r"DTLS.*[Oo][Kk]|dtls.*handshake.*done"),   "LTE: DTLS handshake OK"),
+    (re.compile(r"Timesync sent to BLE"),                    "LTE: timesync sent to BLE"),
+    (re.compile(r"[Cc]onnected to|BLE connected"),           "BLE: sensor connected"),
+    (re.compile(r"OSCORE relay.*queued"),                    "LTE: OSCORE relay queued"),
+    (re.compile(r"Waiting for security config"),             "LTE: waiting for security config"),
+    (re.compile(r"Security config received.*proceeding"),    "LTE: security config applied"),
+    (re.compile(r"Security config timeout"),                 "LTE: security config timeout (mode=none)"),
+]
 
 # ── Text utilities ────────────────────────────────────────────────────────────────
 

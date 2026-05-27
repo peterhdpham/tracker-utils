@@ -1,3 +1,4 @@
 
-tracker-utils/testruns
-tracker-utils/__pycache__
+testruns/
+__pycache__/
+.runtest_state.json

@@ -47,7 +47,7 @@ def ssh_log_reader(source: str, host: str, remote_cmd: str,
                 if stop.is_set():
                     break
                 line = strip_ansi(raw.decode("utf-8", errors="replace").rstrip())
-                if line:
+                if line and "Ignoring unparsable message" not in line:
                     q.put((source, time.time(), line, "dev"))
             proc.wait()
             if not stop.is_set():

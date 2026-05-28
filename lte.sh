@@ -18,24 +18,13 @@ set -euo pipefail
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SNR="${SNR_HUB:-1051217937}"   # nRF9151 DK → Thingy:91X Debug In (SW2: nRF91)
 DEVICE="NRF9151_XXAA"
-APP="${WORKSPACE}/tracker-hub/apps/tracker-hub-lte"
-BUILD_DIR="${WORKSPACE}/build/lte"
 
 build() {
-    nrfutil sdk-manager toolchain launch --ncs-version v3.1.1 -- \
-        west build ${1:+--pristine} \
-            -b thingy91x/nrf9151/ns \
-            --build-dir "${BUILD_DIR}" \
-            "${APP}" \
-            --sysbuild -- \
-            "-DEXTRA_CONF_FILE=${APP}/local.conf"
+    python3 "${WORKSPACE}/tracker-utils/build.py" build lte ${1:+--pristine}
 }
 
 flash() {
-    # TF-M writes UICR into the merged hex; --recover forces ERASE_ALL which is
-    # required when UICR data is already present from a previous flash.
-    nrfutil sdk-manager toolchain launch --ncs-version v3.1.1 -- \
-        west flash --recover --build-dir "${BUILD_DIR}" --snr "${SNR}"
+    python3 "${WORKSPACE}/tracker-utils/build.py" flash lte
 }
 
 usb() {

@@ -1,25 +1,15 @@
 {
-  "name": "OSCORE Recheck",
+  "name": "Full scenario matrix",
   "scenarios": [
-    {
-      "ble": "gatt_oscore",
-      "coap": "oscore",
-      "comment": "OSCORE E2E only"
-    },
-    {
-      "ble": "gatt_oscore",
-      "coap": "dtls_oscore",
-      "comment": "DTLS + OSCORE E2E"
-    },
-    {
-      "ble": "broadcast_oscore",
-      "coap": "oscore",
-      "comment": "Broadcast OSCORE E2E"
-    },
-    {
-      "ble": "broadcast_oscore",
-      "coap": "dtls_oscore",
-      "comment": "Broadcast DTLS + OSCORE E2E"
-    }
+    { "ble": "broadcast",       "coap": "none",       "comment": "Broadcast, no CoAP security" },
+    { "ble": "broadcast",       "coap": "dtls",        "comment": "Broadcast + DTLS" },
+    { "ble": "gatt",            "coap": "none",        "comment": "GATT, no CoAP security" },
+    { "ble": "gatt",            "coap": "dtls",        "comment": "GATT + DTLS" },
+    { "ble": "lesc",            "coap": "none",        "comment": "LESC BLE, no CoAP security" },
+    { "ble": "lesc",            "coap": "dtls",        "comment": "LESC BLE + DTLS" },
+    { "ble": "gatt_oscore",     "coap": "oscore",      "comment": "GATT OSCORE E2E" },
+    { "ble": "gatt_oscore",     "coap": "dtls_oscore", "comment": "GATT OSCORE E2E + DTLS" },
+    { "ble": "broadcast_oscore","coap": "oscore",      "comment": "Broadcast OSCORE E2E" },
+    { "ble": "broadcast_oscore","coap": "dtls_oscore", "comment": "Broadcast OSCORE E2E + DTLS" }
   ]
 }

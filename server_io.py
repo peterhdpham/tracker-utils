@@ -18,6 +18,17 @@ from utils import _dbg
 SSH_SERVER_HOST = "root@10.10.10.10"
 SSH_SERVER_CMD  = "cd tracker-server && docker compose logs -f"
 
+
+def _ssh(cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run *cmd* on SSH_SERVER_HOST; capture stdout+stderr."""
+    return subprocess.run(
+        ["ssh",
+         "-o", "StrictHostKeyChecking=accept-new",
+         "-o", "ConnectTimeout=10",
+         SSH_SERVER_HOST, cmd],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
 # ── SSH log reader ────────────────────────────────────────────────────────────────
 
 def ssh_log_reader(source: str, host: str, remote_cmd: str,

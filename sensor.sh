@@ -16,21 +16,13 @@ set -euo pipefail
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SNR="${SNR_SENSOR:-1050065248}"   # nRF52 DK → Thingy:53 SWD pads
 DEVICE="NRF5340_XXAA_APP"
-BUILD_DIR="${WORKSPACE}/build/sensor"
 
 build() {
-    nrfutil sdk-manager toolchain launch --ncs-version v3.1.1 -- \
-        west build ${1:+--pristine} \
-            -b thingy53/nrf5340/cpuapp \
-            --build-dir "${BUILD_DIR}" \
-            "${WORKSPACE}/tracker-sensor-node/tracker-node"
+    python3 "${WORKSPACE}/tracker-utils/build.py" build sensor ${1:+--pristine}
 }
 
 flash() {
-    # No --erase: address-range erase only, preserving UICR.
-    # ERASEALL wipes UICR → re-enables APPROTECT + ERASEPROTECT on boot.
-    nrfutil sdk-manager toolchain launch --ncs-version v3.1.1 -- \
-        west flash --build-dir "${BUILD_DIR}" --snr "${SNR}"
+    python3 "${WORKSPACE}/tracker-utils/build.py" flash sensor
 }
 
 recover() {

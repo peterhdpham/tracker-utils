@@ -18,23 +18,13 @@ set -euo pipefail
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SNR="${SNR_HUB:-1051217937}"   # nRF9151 DK → Thingy:91X Debug In (SW2: nRF53)
 DEVICE="NRF5340_XXAA_APP"
-BUILD_DIR="${WORKSPACE}/build/ble"
 
 build() {
-    nrfutil sdk-manager toolchain launch --ncs-version v3.1.1 -- \
-        west build ${1:+--pristine} \
-            -b thingy91x/nrf5340/cpuapp \
-            --build-dir "${BUILD_DIR}" \
-            "${WORKSPACE}/tracker-hub/apps/tracker-hub-ble" \
-            -- -DEXTRA_CONF_FILE=local.conf
+    python3 "${WORKSPACE}/tracker-utils/build.py" build ble ${1:+--pristine}
 }
 
 flash() {
-    # Recover both cores first — clears ERASEPROTECT/APPROTECT before programming.
-    nrfutil device recover --serial-number "${SNR}" --core Network
-    nrfutil device recover --serial-number "${SNR}" --core Application
-    nrfutil sdk-manager toolchain launch --ncs-version v3.1.1 -- \
-        west flash --reset --build-dir "${BUILD_DIR}" --snr "${SNR}"
+    python3 "${WORKSPACE}/tracker-utils/build.py" flash ble
 }
 
 usb() {

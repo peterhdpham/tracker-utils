@@ -9,7 +9,6 @@ Covers:
 
 import glob
 import queue
-import socket
 import threading
 import time
 
@@ -45,7 +44,7 @@ def find_thingy53_port():
 # ── Serial reader ────────────────────────────────────────────────────────────────
 
 def serial_reader(source: str, port: str, q: queue.Queue, stop: threading.Event,
-                  quiet: threading.Event | None = None, reconnect_cb=None,
+                  quiet: threading.Event | None = None,
                   write_q: queue.Queue | None = None):
     """
     Reconnecting serial reader for one CDC-ACM device.
@@ -65,9 +64,6 @@ def serial_reader(source: str, port: str, q: queue.Queue, stop: threading.Event,
     while not stop.is_set():
         try:
             with serial.Serial(port, BAUD, timeout=0.1) as ser:
-                if not first_ever and reconnect_cb:
-                    _dbg(f"serial_reader [{source}]: reconnected — triggering JLink respawn")
-                    reconnect_cb()
                 first_ever    = False
                 was_connected = True
                 _dbg(f"serial_reader [{source}]: connected")
@@ -106,45 +102,3 @@ def serial_reader(source: str, port: str, q: queue.Queue, stop: threading.Event,
                     q.put((source, time.time(), f"[error: {e}]", "status"))
                 was_connected = False
                 time.sleep(0.05)
-
-
-# ── RTT reader ───────────────────────────────────────────────────────────────────
-
-def rtt_reader(source: str, host: str, port: int,
-               q: queue.Queue, stop: threading.Event,
-               startup_delay: float = 2.5):
-    """
-    Read RTT output from JLinkGDBServer's telnet port.
-
-    Waits *startup_delay* seconds for the GDB server to attach before connecting.
-    Retries every 3 s on connection failure.
-    """
-    _dbg(f"rtt_reader [{source}]: started, waiting {startup_delay}s before connecting to :{port}")
-    time.sleep(startup_delay)
-    while not stop.is_set():
-        try:
-            with socket.create_connection((host, port), timeout=5) as sock:
-                _dbg(f"rtt_reader [{source}]: connected to {host}:{port}")
-                q.put((source, time.time(), f"[RTT connected → {host}:{port}]", "status"))
-                sock.settimeout(1.0)
-                buf = b""
-                while not stop.is_set():
-                    try:
-                        chunk = sock.recv(1024)
-                        if not chunk:
-                            break
-                        buf += chunk
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
-                            text = strip_ansi(
-                                line.decode("utf-8", errors="replace").rstrip("\r"))
-                            if text:
-                                q.put((source, time.time(), text, "dev"))
-                    except socket.timeout:
-                        continue
-        except (ConnectionRefusedError, OSError) as e:
-            if not stop.is_set():
-                _dbg(f"rtt_reader [{source}]: connection failed ({e}) — retrying in 3 s")
-                q.put((source, time.time(),
-                       f"[RTT not ready ({e}) — retrying in 3 s]", "status"))
-                time.sleep(3)

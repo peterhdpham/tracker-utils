@@ -61,8 +61,11 @@ if str(_HERE) not in sys.path:
 from build_config import (
     TARGETS, NRFUTIL_WRAP, _BLE_APP, _SENS_APP, _effective_build_cmd,
 )
+from kconfig_utils import (
+    _update_kconfig_key, _set_kconfig_mode, _set_kconfig_value, _read_kconfig_value,
+)
 from serial_io import find_thingy91x_ports, find_thingy53_port
-from server_io import SSH_SERVER_HOST
+from server_io import SSH_SERVER_HOST, _ssh
 from ui_constants import _OSCORE_BLE_MODES, _OSCORE_COAP_MODES, _HUB_BLE_RELAY_FLAGS
 
 # ── Scenario definitions ──────────────────────────────────────────────────────
@@ -179,42 +182,8 @@ def _conf_hash(*paths: Path) -> str:
         h.update(p.read_bytes() if p.exists() else b"")
     return h.hexdigest()
 
-def _set_kconfig_mode(path: Path, prefix: str, new_line: str):
-    text = path.read_text() if path.exists() else ""
-    pat  = re.compile(rf"^{re.escape(prefix)}\w+=y", re.M)
-    text = pat.sub(new_line, text) if pat.search(text) else (text.rstrip("\n") + "\n" + new_line + "\n")
-    path.write_text(text)
-
-def _set_kconfig_value(path: Path, key: str, value: bool):
-    text = path.read_text() if path.exists() else ""
-    pat  = re.compile(rf"^{re.escape(key)}=.*\n?", re.M)
-    text = pat.sub("", text)
-    # Always write explicit state so prj.conf defaults are overridden.
-    text = text.rstrip("\n") + f"\n{key}={'y' if value else 'n'}\n"
-    path.write_text(text)
-
-def _update_kconfig_key(path: Path, line: str):
-    key  = line.split("=")[0]
-    text = path.read_text() if path.exists() else ""
-    pat  = re.compile(rf"^{re.escape(key)}=.*", re.M)
-    text = pat.sub(line, text) if pat.search(text) else (text.rstrip("\n") + "\n" + line + "\n")
-    path.write_text(text)
-
-def _read_kconfig_value(path: Path, key: str) -> str:
-    if not path.exists():
-        return ""
-    m = re.search(rf'^{re.escape(key)}="?(.*?)"?\s*$', path.read_text(), re.M)
-    return m.group(1) if m else ""
-
 
 # ── SSH helpers ───────────────────────────────────────────────────────────────
-
-def _ssh(cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["ssh", "-o", "StrictHostKeyChecking=accept-new",
-         "-o", "ConnectTimeout=10", SSH_SERVER_HOST, cmd],
-        capture_output=True, text=True, timeout=timeout,
-    )
 
 def _wait_lte_patterns(lte_port: str | None,
                        patterns_and_timeouts: list[tuple[str, float]],

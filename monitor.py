@@ -14,25 +14,23 @@ Ports (stable names):
 """
 
 import argparse
-import glob
 import sys
 import threading
 import time
+from pathlib import Path
+
 import serial
 
-BAUD = 115200
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from serial_io import find_thingy91x_ports
+from ui_constants import BAUD
 
 ANSI_RESET  = "\033[0m"
 ANSI_CYAN   = "\033[96m"   # BLE console
 ANSI_YELLOW = "\033[93m"   # LTE mirror
-
-
-def find_thingy_ports():
-    pattern = "/dev/serial/by-id/usb-Nordic_Semiconductor_Thingy*91*"
-    ports = sorted(glob.glob(pattern))
-    if00 = next((p for p in ports if p.endswith("-if00")), None)
-    if02 = next((p for p in ports if p.endswith("-if02")), None)
-    return if00, if02
 
 
 def reader(label: str, port: str, color: str, stop_event: threading.Event):
@@ -79,11 +77,11 @@ def main():
 
     # Auto-detect missing ports (skipped for the excluded side in single-port modes)
     if not args.lte_only and not ble_port:
-        ble_port, auto_lte = find_thingy_ports()
+        ble_port, auto_lte = find_thingy91x_ports()
         if not args.ble_only and not lte_port:
             lte_port = auto_lte
     elif not args.ble_only and not lte_port:
-        _, lte_port = find_thingy_ports()
+        _, lte_port = find_thingy91x_ports()
 
     if args.lte_only:
         ble_port = None

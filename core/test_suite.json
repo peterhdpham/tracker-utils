@@ -1,0 +1,10 @@
+{
+  "name": "Smoke test (5 scenarios)",
+  "scenarios": [
+    { "ble": "broadcast",        "coap": "none",        "comment": "Baseline — no security" },
+    { "ble": "gatt",             "coap": "dtls",        "comment": "GATT + DTLS" },
+    { "ble": "lesc",             "coap": "oscore",      "comment": "LESC + OSCORE" },
+    { "ble": "gatt_oscore",      "coap": "dtls_oscore", "comment": "GATT OSCORE E2E + DTLS (thesis target)" },
+    { "ble": "broadcast_oscore", "coap": "oscore",      "comment": "Broadcast OSCORE E2E" }
+  ]
+}

@@ -15,20 +15,20 @@
 
 set -euo pipefail
 
-WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SNR="${SNR_HUB:-1051217937}"   # nRF9151 DK → Thingy:91X Debug In (SW2: nRF53)
 DEVICE="NRF5340_XXAA_APP"
 
 build() {
-    python3 "${WORKSPACE}/tracker-utils/build.py" build ble ${1:+--pristine}
+    python3 "${WORKSPACE}/tracker-utils/tools/build.py" build ble ${1:+--pristine}
 }
 
 flash() {
-    python3 "${WORKSPACE}/tracker-utils/build.py" flash ble
+    python3 "${WORKSPACE}/tracker-utils/tools/build.py" flash ble
 }
 
 usb() {
-    python3 "${WORKSPACE}/tracker-utils/monitor.py" --ble-only
+    python3 "${WORKSPACE}/tracker-utils/tools/monitor.py" --ble-only
 }
 
 rtt() {

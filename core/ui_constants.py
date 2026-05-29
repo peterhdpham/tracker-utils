@@ -10,8 +10,8 @@ import re
 # ── Panel / source names ─────────────────────────────────────────────────────────
 
 BAUD            = 115200
-SOURCES         = ["BLE", "LTE", "Thingy53", "Server", "Events"]
-_DEVICE_SOURCES = ["BLE", "LTE", "Thingy53"]
+SOURCES         = ["LTE", "BLE", "Thingy53", "Server", "Events"]
+_DEVICE_SOURCES = ["LTE", "BLE", "Thingy53"]
 
 # Sentinel: queue item whose payload[2] is a callable to run on the main thread.
 _UI_ = "__ui__"
@@ -44,10 +44,11 @@ _RESET_LABEL = {
 }
 
 LOG_LEVEL_COLOR = {
-    "dbg": "#79c0ff",   # blue
-    "inf": "#e6edf3",   # near-white
-    "err": "#ff7b72",   # red
-    "wrn": "#e3b341",   # amber
+    "dbg":       "#79c0ff",   # blue
+    "inf":       "#e6edf3",   # near-white
+    "err":       "#ff7b72",   # red
+    "wrn":       "#e3b341",   # amber
+    "milestone": "#d2a8ff",   # purple — [Module] milestone line
 }
 
 # ── Regex patterns ────────────────────────────────────────────────────────────────
@@ -55,6 +56,7 @@ LOG_LEVEL_COLOR = {
 _ANSI_RE      = re.compile(r"\x1b(?:\[[0-9;]*[A-Za-z]|[A-Za-z])")
 _PROMPT_RE    = re.compile(r"^(?:uart:~\$\s*)+")
 _LOG_LEVEL_RE = re.compile(r"<(dbg|inf|err|wrn)>")
+_MILESTONE_RE = re.compile(r"\[(Sensor|BLE|LTE|Server|Test)\] ")
 
 # ── Security mode constants ───────────────────────────────────────────────────────
 
@@ -89,21 +91,24 @@ _HUB_BLE_RELAY_FLAGS: dict[str, dict[str, bool]] = {
 }
 
 # ── Event pattern matching ────────────────────────────────────────────────────────
-# Patterns matched against log lines from any device source to auto-emit structured
-# milestones into the Events panel. Used by both viewer.py and runtest.py.
+# Patterns matched against raw log lines from any device UART source.
+# When matched, the label is forwarded to the Events panel as "[source] label".
+# Milestone strings ([Module] ...) are handled separately in _append — they are
+# forwarded verbatim to Events so the [Module] prefix is preserved exactly.
+# These legacy patterns cover old firmware that has not yet been updated.
 
 _EVENT_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\*\*\* Booting"),                          "rebooted"),
-    (re.compile(r"Security config sent to nRF9151"),         "BLE: security_config sent"),
-    (re.compile(r"security_config: mode="),                  "LTE: security_config received"),
-    (re.compile(r"[Nn]etwork connected"),                    "LTE: network connected"),
-    (re.compile(r"DTLS.*[Oo][Kk]|dtls.*handshake.*done"),   "LTE: DTLS handshake OK"),
-    (re.compile(r"Timesync sent to BLE"),                    "LTE: timesync sent to BLE"),
-    (re.compile(r"[Cc]onnected to|BLE connected"),           "BLE: sensor connected"),
-    (re.compile(r"OSCORE relay.*queued"),                    "LTE: OSCORE relay queued"),
-    (re.compile(r"Waiting for security config"),             "LTE: waiting for security config"),
-    (re.compile(r"Security config received.*proceeding"),    "LTE: security config applied"),
-    (re.compile(r"Security config timeout"),                 "LTE: security config timeout (mode=none)"),
+    (re.compile(r"\*\*\* Booting"),                         "rebooted"),
+    (re.compile(r"Security config sent to nRF9151"),        "BLE: security_config sent"),
+    (re.compile(r"security_config: mode="),                 "LTE: security_config received"),
+    (re.compile(r"[Nn]etwork connected"),                   "LTE: network connected"),
+    (re.compile(r"DTLS.*[Oo][Kk]|dtls.*handshake.*done"),  "LTE: DTLS handshake OK"),
+    (re.compile(r"Timesync sent to BLE"),                   "LTE: timesync sent to BLE"),
+    (re.compile(r"[Cc]onnected to|BLE connected"),          "BLE: sensor connected"),
+    (re.compile(r"OSCORE relay.*queued"),                   "LTE: OSCORE relay queued"),
+    (re.compile(r"Waiting for security config"),            "LTE: waiting for security config"),
+    (re.compile(r"Security config received.*proceeding"),   "LTE: security config applied"),
+    (re.compile(r"Security config timeout"),                "LTE: security config timeout"),
 ]
 
 # ── Text utilities ────────────────────────────────────────────────────────────────
@@ -113,5 +118,7 @@ def strip_ansi(s: str) -> str:
 
 
 def _dev_tag(msg: str) -> str:
+    if _MILESTONE_RE.search(msg):
+        return "milestone"
     m = _LOG_LEVEL_RE.search(msg)
     return m.group(1) if m else "msg"

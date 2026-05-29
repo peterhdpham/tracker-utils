@@ -18,8 +18,9 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_CORE = _HERE.parent / "core"
+if str(_CORE) not in sys.path:
+    sys.path.insert(0, str(_CORE))
 
 from build_config import TARGETS, NRFUTIL_WRAP, _effective_build_cmd
 

@@ -45,7 +45,7 @@ from pathlib import Path
 import aiocoap
 import cbor2
 
-WORKSPACE = Path(__file__).resolve().parent.parent
+WORKSPACE = Path(__file__).resolve().parent.parent.parent
 SERVER_ENV = WORKSPACE / "tracker-server" / ".env"
 SERVER_TESTING_ENV = WORKSPACE / "tracker-server" / ".env.testing"
 HUB_LTE_CONF = WORKSPACE / "tracker-hub" / "apps" / "tracker-hub-lte" / "local.conf"

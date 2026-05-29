@@ -15,6 +15,7 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, scrolledtext
+from typing import Any
 
 from build_config import (
     NCS_VERSION, NRFUTIL_WRAP, TARGETS, _effective_build_cmd,
@@ -24,7 +25,7 @@ from serial_io import find_thingy91x_ports, find_thingy53_port, serial_reader
 from server_io import SSH_SERVER_HOST, SSH_SERVER_CMD, ssh_log_reader, _ssh
 from ui_constants import (
     BAUD, SOURCES, _DEVICE_SOURCES, PALETTE, SOURCE_COLOR, _RESET_LABEL,
-    _UI_, LOG_LEVEL_COLOR,
+    _UI_, LOG_LEVEL_COLOR, _MILESTONE_RE,
     _COAP_LABELS, _BLE_LABELS, _COAP_MODE_PAT, _BLE_MODE_PAT,
     _OSCORE_BLE_MODES, _OSCORE_COAP_MODES, _HUB_BLE_RELAY_FLAGS,
     _EVENT_PATTERNS,
@@ -32,6 +33,7 @@ from ui_constants import (
 )
 from kconfig_utils import _update_kconfig_key, _set_kconfig_mode, _set_kconfig_value
 from utils import _dbg, _stream_action
+import milestones as _MS
 
 
 class LogViewer(tk.Tk):
@@ -90,9 +92,20 @@ class LogViewer(tk.Tk):
         self._log_watcher_mu = threading.Lock()
         # test-run state
         self._test_running           = False
-        self._test_run_btn:    tk.Button | None = None
-        self._test_status_lbl: tk.Label | None = None
-        self._test_mode_lbl:   tk.Label | None = None
+        self._cancel_event           = threading.Event()
+        self._test_run_btn:      tk.Button | None = None
+        self._suite_run_btn:     tk.Button | None = None
+        self._smoke_run_btn:     tk.Button | None = None
+        self._prebuild_btn:      tk.Button | None = None
+        self._prebuilt_run_btn:  tk.Button | None = None
+        self._build_suite_btn:   tk.Button | None = None
+        self._cancel_btn:        tk.Button | None = None
+        self._prebuild_session                    = None
+        self._prebuild_status_lbl: tk.Label | None = None
+        self._test_status_lbl:   tk.Label | None = None
+        self._milestone_win_proc: subprocess.Popen | None = None
+        self._live_log: Any = None   # active EventLog during a test; read from Tk thread, set by test thread
+        self._test_mode_lbl:     tk.Label | None = None
         self._wrong_dtls_var         = tk.BooleanVar(value=False)
         self._wrong_oscore_hub_var   = tk.BooleanVar(value=False)
         self._wrong_oscore_sensor_var = tk.BooleanVar(value=False)
@@ -114,6 +127,7 @@ class LogViewer(tk.Tk):
 
         self._launch(ble_port, lte_port, sensor_port)
         self._poll()
+        self.after(200, self._refresh_prebuild_status)
 
     # ── UI construction ──────────────────────────────────────────────────────
 
@@ -224,7 +238,10 @@ class LogViewer(tk.Tk):
             txt.tag_configure("msg",  foreground="#e6edf3")
             txt.tag_configure("meta", foreground=PALETTE["MUTE"])
             for level, color in LOG_LEVEL_COLOR.items():
-                txt.tag_configure(level, foreground=color)
+                if level == "milestone":
+                    txt.tag_configure(level, foreground=color, font=("monospace", 9, "bold"))
+                else:
+                    txt.tag_configure(level, foreground=color)
             txt.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
             self._texts[src] = txt
 
@@ -278,7 +295,7 @@ class LogViewer(tk.Tk):
 
         # BLE column
         ble_col = tk.Frame(act, bg=PALETTE["BG"])
-        ble_col.grid(row=0, column=0, sticky="w", padx=(6, 3), pady=2)
+        ble_col.grid(row=0, column=1, sticky="w", padx=3, pady=2)
         ble_r0 = tk.Frame(ble_col, bg=PALETTE["BG"])
         ble_r0.pack(fill=tk.X)
         cbtn(ble_r0, "Build",          lambda: self._do_build("ble"),                          "ble", "BLE")
@@ -291,7 +308,7 @@ class LogViewer(tk.Tk):
 
         # LTE column
         lte_col = tk.Frame(act, bg=PALETTE["BG"])
-        lte_col.grid(row=0, column=1, sticky="w", padx=3, pady=2)
+        lte_col.grid(row=0, column=0, sticky="w", padx=(6, 3), pady=2)
         lte_r0 = tk.Frame(lte_col, bg=PALETTE["BG"])
         lte_r0.pack(fill=tk.X)
         cbtn(lte_r0, "Build",          lambda: self._do_build("lte"),                          "lte", "LTE")
@@ -362,7 +379,58 @@ class LogViewer(tk.Tk):
             padx=8, pady=3, font=("monospace", 9, "bold"),
             command=self._run_suite,
         )
-        self._suite_run_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._suite_run_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._smoke_run_btn = tk.Button(
+            test_bar, text="▶ Smoke",
+            bg="#1a1a2e", fg="#79c0ff",
+            activebackground="#22223a", relief=tk.FLAT,
+            padx=8, pady=3, font=("monospace", 9),
+            command=self._run_smoke,
+        )
+        self._smoke_run_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._prebuilt_run_btn = tk.Button(
+            test_bar, text="▶ Prebuilt",
+            bg="#1a2a1a", fg="#79c0ff",
+            activebackground="#223022", relief=tk.FLAT,
+            padx=8, pady=3, font=("monospace", 9, "bold"),
+            command=self._run_prebuilt_suite,
+        )
+        self._prebuilt_run_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._prebuild_btn = tk.Button(
+            test_bar, text="⚙ Prebuild",
+            bg="#1a2a1a", fg="#57ab5a",
+            activebackground="#223022", relief=tk.FLAT,
+            padx=8, pady=3, font=("monospace", 9),
+            command=self._prebuild_suite,
+        )
+        self._prebuild_btn.pack(side=tk.LEFT, padx=(0, 2))
+
+        self._prebuild_status_lbl = tk.Label(
+            test_bar, text="", fg=PALETTE["MUTE"], bg=PALETTE["BG"],
+            font=("monospace", 8))
+        self._prebuild_status_lbl.pack(side=tk.LEFT, padx=(0, 6))
+
+        self._build_suite_btn = tk.Button(
+            test_bar, text="⚙▶ Build+Suite",
+            bg="#1a1a2e", fg="#a371f7",
+            activebackground="#22223a", relief=tk.FLAT,
+            padx=8, pady=3, font=("monospace", 9, "bold"),
+            command=self._prebuild_then_suite,
+        )
+        self._build_suite_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._cancel_btn = tk.Button(
+            test_bar, text="✕ Cancel",
+            bg="#2a1010", fg=PALETTE["RED"],
+            activebackground="#3a1818", relief=tk.FLAT,
+            padx=8, pady=3, font=("monospace", 9, "bold"),
+            state=tk.DISABLED,
+            command=self._cancel_test,
+        )
+        self._cancel_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self._test_status_lbl = tk.Label(
             test_bar, text="", fg=PALETTE["MUTE"], bg=PALETTE["BG"],
@@ -591,10 +659,31 @@ class LogViewer(tk.Tk):
             self._csv_file.flush()
 
         if source != "Events":
-            for pat, label in _EVENT_PATTERNS:
-                if pat.search(msg):
-                    self._emit_event(f"[{source}] {label}")
-                    break
+            # Forward firmware UART milestone strings to the active test live log.
+            # self._live_log is set by _run_test_thread (background thread); Python GIL
+            # makes the reference read atomic.  EventLog.log() is lock-protected.
+            if kind == "dev":
+                _ll = self._live_log
+                if _ll is not None:
+                    for _ms in _MS.FIRMWARE_MILESTONES:
+                        if _ms in msg:
+                            _ll.log(_ms)
+                            break
+                    else:
+                        # Timesync: firmware emits "Timesync sent to BLE central: …"
+                        if source == "LTE" and "Timesync sent to BLE" in msg:
+                            _ll.log(_MS.LTE_TIMESYNC_SENT)
+
+            m = _MILESTONE_RE.search(msg)
+            if m:
+                # Forward the milestone string verbatim — extract from the match
+                # position so it works even when wrapped in a Zephyr log prefix.
+                self._emit_event(msg[m.start():].split("\n")[0].strip())
+            else:
+                for pat, label in _EVENT_PATTERNS:
+                    if pat.search(msg):
+                        self._emit_event(f"[{source}] {label}")
+                        break
             with self._log_watcher_mu:
                 for wsrc, wpat, wev in self._log_watchers:
                     if wsrc == source and wpat.search(msg):
@@ -615,9 +704,18 @@ class LogViewer(tk.Tk):
         return ev
 
     def _finish_log_watcher(self, ev: threading.Event, timeout: float) -> bool:
-        """Wait for a previously registered watcher event. Removes it when done."""
+        """Wait for a previously registered watcher event. Removes it when done.
+        Polls _cancel_event every 250 ms so a cancel request breaks long waits quickly."""
         try:
-            return ev.wait(timeout)
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                if self._cancel_event.is_set():
+                    return False
+                if ev.wait(min(remaining, 0.25)):
+                    return True
         finally:
             with self._log_watcher_mu:
                 self._log_watchers[:] = [w for w in self._log_watchers if w[2] is not ev]
@@ -626,6 +724,33 @@ class LogViewer(tk.Tk):
         """Register watcher and block until *pattern* appears, or *timeout* expires."""
         ev = self._register_log_watcher(source, pattern)
         return self._finish_log_watcher(ev, timeout)
+
+    def _cancel_test(self):
+        """User clicked Cancel — signal all test/suite threads to stop."""
+        self._cancel_event.set()
+        if self._cancel_btn:
+            self._cancel_btn.config(state=tk.DISABLED)
+        self._test_status_lbl.config(text="cancelling…", fg=PALETTE["RED"])
+        self._emit_event("[Test] Cancelled by user")
+
+    def _make_suite_folder(self, suite_name: str, total: int) -> "tuple[Path, Path]":
+        """Create timestamped suite folder under testruns/, write live file header."""
+        ts         = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        suite_path = Path(__file__).parent.parent / "testruns" / f"{ts}_suite-{suite_name}"
+        suite_path.mkdir(parents=True, exist_ok=True)
+        live_path  = suite_path / "milestone_live.txt"
+        live_path.write_text(f"[Suite] {total}  {ts}  {suite_name}\n", encoding="utf-8")
+        return suite_path, live_path
+
+    def _launch_milestone_window(self, live_path: Path):
+        """Spawn the milestone tracker window as a detached background process."""
+        import sys as _sys
+        if self._milestone_win_proc and self._milestone_win_proc.poll() is None:
+            return  # already running
+        self._milestone_win_proc = subprocess.Popen(
+            [_sys.executable, str(Path(__file__).parent / "milestone_window.py"), str(live_path)],
+            start_new_session=True,
+        )
 
     def _update_test_mode_label(self):
         if self._test_mode_lbl:
@@ -643,26 +768,45 @@ class LogViewer(tk.Tk):
             "wrong_oscore_hub"    if self._wrong_oscore_hub_var.get()    else None,
             "wrong_oscore_sensor" if self._wrong_oscore_sensor_var.get() else None,
         ]))
+        suite_path, live_path = self._make_suite_folder("single", 1)
+        self._launch_milestone_window(live_path)
+
+        self._cancel_event.clear()
         self._test_running = True
         self._test_run_btn.config(state=tk.DISABLED, text="● Running…")
-        self._test_status_lbl.config(text="starting…")
+        self._suite_run_btn.config(state=tk.DISABLED)
+        self._smoke_run_btn.config(state=tk.DISABLED)
+        self._prebuilt_run_btn.config(state=tk.DISABLED)
+        self._build_suite_btn.config(state=tk.DISABLED)
+        self._cancel_btn.config(state=tk.NORMAL)
+        self._test_status_lbl.config(text="starting…", fg=PALETTE["MUTE"])
         self._emit_event(f"Test started: {ble} + {coap}")
 
         def _run():
             try:
-                self._run_test_thread(ble, coap, wrong)
+                self._run_test_thread(ble, coap, wrong, suite_path=suite_path,
+                                      live_path=live_path, idx=1, write_suite_summary=True)
             except Exception as e:
                 self._emit_event(f"Test ERROR: {e}")
             finally:
                 self._test_running = False
                 self.after(0, lambda: (
                     self._test_run_btn.config(state=tk.NORMAL, text="▶ Run Test"),
-                    self._test_status_lbl.config(text=""),
+                    self._suite_run_btn.config(state=tk.NORMAL),
+                    self._smoke_run_btn.config(state=tk.NORMAL),
+                    self._prebuilt_run_btn.config(state=tk.NORMAL),
+                    self._build_suite_btn.config(state=tk.NORMAL),
+                    self._cancel_btn.config(state=tk.DISABLED),
+                    self._test_status_lbl.config(text="", fg=PALETTE["MUTE"]),
                 ))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _run_test_thread(self, ble_mode: str, coap_mode: str, wrong_flags: frozenset):
+    def _run_test_thread(self, ble_mode: str, coap_mode: str, wrong_flags: frozenset,
+                         prebuild_session=None, suite_path: Path | None = None,
+                         live_path: Path | None = None, idx: int | None = None,
+                         total: int = 1,
+                         write_suite_summary: bool = False):
         import sys as _sys
         _here = Path(__file__).parent.resolve()
         if str(_here) not in _sys.path:
@@ -674,32 +818,30 @@ class LogViewer(tk.Tk):
             self._test_status_lbl.config(text=msg)
             self._emit_event(msg)
 
-        log = _rt.EventLog()
+        log = _rt.EventLog(live_path=live_path)
+        self._live_log = log   # expose to _append() for UART milestone forwarding
 
         # Validate pairing
         from ui_constants import _OSCORE_BLE_MODES, _OSCORE_COAP_MODES
-        if (ble_mode in _OSCORE_BLE_MODES) != (coap_mode in _OSCORE_COAP_MODES):
-            _status("Invalid pairing — BLE/CoAP OSCORE mismatch")
+        if (ble_mode in _OSCORE_BLE_MODES) and (coap_mode not in _OSCORE_COAP_MODES):
+            _status("Invalid pairing — BLE OSCORE requires CoAP OSCORE")
             return
 
-        run_dir = _rt.RunDir(ble_mode, coap_mode, wrong_flags)
+        run_dir = _rt.RunDir(ble_mode, coap_mode, wrong_flags, suite_path=suite_path, idx=idx)
+        # Record panel buffer offsets so we only save lines from this test onwards.
+        log_offsets = {src: len(self._all_lines.get(src, [])) for src in ("BLE", "LTE", "Thingy53")}
         label   = f"{ble_mode} + {coap_mode}"
         if wrong_flags:
             label += f"  [{', '.join(wrong_flags)}]"
-        log.log(f"TEST: {label}")
+        log.log(f"{_MS.T_SCENARIO} {idx or 1}/{total}: {ble_mode} + {coap_mode}")
         log.log(f"Results → testruns/{run_dir.path.name}")
         t_start = time.time()
-
-        # Load state for smart sensor rebuild
-        state           = _rt._load_state()
-        last_ble        = state.get("last_ble", "")
-        sensor_hash_old = state.get("sensor_conf_hash", "")
 
         # Write configs
         _status("writing configs…")
         _rt._setup_configs(ble_mode, coap_mode, wrong_flags, log)
-        sensor_hash_new = _rt._conf_hash(_rt._SENS_APP / "security.conf")
-        rebuild_sensor  = (ble_mode != last_ble) or (sensor_hash_new != sensor_hash_old)
+        log.log(_MS.T_WRITING_CONFIGS)
+        rebuild_sensor = True
 
         # Snapshot configs
         from build_config import _BLE_APP, _SENS_APP
@@ -715,6 +857,7 @@ class LogViewer(tk.Tk):
 
         # Phase 1: Reset LTE via write queue, parallel build + server restart
         _status("reset LTE…")
+        log.log(_MS.T_RESETTING_LTE)
         log.log("BLE→LTE: sending reset lte via logviewer write queue")
         self._write_queues["BLE"].put(b"reset lte\r\n")
         time.sleep(0.5)
@@ -762,7 +905,77 @@ class LogViewer(tk.Tk):
                 if snr:
                     self._snr_release(snr)
 
+        def _stream_flash_from_dir(key: str, build_dir) -> bool:
+            tgt    = TARGETS[key]
+            snr    = tgt.get("snr")
+            panels = tgt["panels"]
+            if snr and not self._snr_try_acquire(snr, panels):
+                log.log(f"Flash blocked — programmer {snr} busy")
+                return False
+            try:
+                for pre_cmd in tgt.get("pre_flash_cmds", []):
+                    r = subprocess.run(pre_cmd, capture_output=True, text=True)
+                    if r.returncode != 0:
+                        msg = r.stderr.strip() or r.stdout.strip()
+                        for p in panels:
+                            self._q.put((p, time.time(), f"[pre-flash failed: {msg}]", "build"))
+                        return False
+                flash_cmd = list(tgt["flash_cmd"])
+                bd_idx = flash_cmd.index("--build-dir")
+                flash_cmd[bd_idx + 1] = str(build_dir)
+                ok_box = [False]
+                _stream_action(
+                    f"flash {key} (prebuilt)", panels, tgt["cwd"],
+                    NRFUTIL_WRAP + flash_cmd, self._q,
+                    done_cb=lambda ok: ok_box.__setitem__(0, ok),
+                )
+                if ok_box[0]:
+                    self._emit_event(f"{tgt['label']}: flashed (prebuilt)")
+                return ok_box[0]
+            finally:
+                if snr:
+                    self._snr_release(snr)
+
         build_ok: dict[str, bool] = {}
+        use_prebuild_sensor = False
+        use_prebuild_ble    = False
+
+        # ── Prebuild-aware build resolution ───────────────────────────────────
+        if prebuild_session is not None and not wrong_flags:
+            sensor_status = prebuild_session.get_sensor_status(ble_mode)
+            ble_status    = prebuild_session.get_ble_status(ble_mode, coap_mode)
+
+            if sensor_status in ("building", "pending"):
+                _status("waiting for prebuild: sensor…")
+                log.log(f"Sensor [{ble_mode}]: waiting for prebuild…")
+                sensor_status = prebuild_session.wait_for_sensor(ble_mode)
+            if ble_status in ("building", "pending"):
+                _status("waiting for prebuild: BLE…")
+                log.log(f"BLE [{_rt._ble_variant_key(ble_mode, coap_mode)}]: waiting for prebuild…")
+                ble_status = prebuild_session.wait_for_ble(ble_mode, coap_mode)
+
+            if sensor_status == "failed":
+                _status("Prebuild sensor FAILED")
+                log.log("Sensor prebuild FAILED — aborting scenario")
+                run_dir.write_timeline(log)
+                return False
+            if ble_status == "failed":
+                _status("Prebuild BLE FAILED")
+                log.log("BLE prebuild FAILED — aborting scenario")
+                run_dir.write_timeline(log)
+                return False
+
+            if (sensor_status == "done" and
+                    _rt._prebuild_artifact_ready(prebuild_session.sensor_dirs[ble_mode])):
+                use_prebuild_sensor = True
+                build_ok["sensor"]  = True
+                log.log(f"Sensor: using prebuilt [{prebuild_session.sensor_dirs[ble_mode].name}]")
+            if (ble_status == "done" and
+                    _rt._prebuild_artifact_ready(
+                        prebuild_session.ble_dirs[_rt._ble_variant_key(ble_mode, coap_mode)])):
+                use_prebuild_ble = True
+                build_ok["ble"]  = True
+                log.log(f"BLE: using prebuilt [{prebuild_session.ble_dirs[_rt._ble_variant_key(ble_mode, coap_mode)].name}]")
 
         def _do_build_ble():
             build_ok["ble"] = _stream_build("ble", pristine=True)
@@ -773,52 +986,98 @@ class LogViewer(tk.Tk):
         def _do_restart_server():
             build_ok["server"] = _rt._ssh_restart_server(log)
 
-        build_threads = [threading.Thread(target=_do_build_ble, daemon=True)]
-        if rebuild_sensor:
-            log.log(f"Sensor: rebuild (BLE mode {last_ble!r} → {ble_mode!r} or config changed)")
-            build_threads.append(threading.Thread(target=_do_build_sensor, daemon=True))
-        else:
-            build_ok["sensor"] = True
-            log.log("Sensor: skipping rebuild (unchanged)")
+        build_threads = []
+        if not use_prebuild_ble:
+            build_threads.append(threading.Thread(target=_do_build_ble, daemon=True))
+        if not use_prebuild_sensor:
+            if rebuild_sensor:
+                log.log(f"Sensor: rebuild ({ble_mode})")
+                build_threads.append(threading.Thread(target=_do_build_sensor, daemon=True))
+            else:
+                build_ok["sensor"] = True
+                log.log("Sensor: skipping rebuild (unchanged)")
         build_threads.append(threading.Thread(target=_do_restart_server, daemon=True))
 
-        _status("building…")
+        _status("building…" if build_threads[:-1] else "restarting server…")
         for t in build_threads:
             t.start()
 
         log.log(f"Waiting {_rt._WAIT_LTE_REBOOT} s for LTE reboot while builds run…")
-        time.sleep(_rt._WAIT_LTE_REBOOT)
+        if self._cancel_event.wait(_rt._WAIT_LTE_REBOOT):
+            _status("Cancelled")
+            run_dir.write_timeline(log)
+            return False
 
         for t in build_threads:
             t.join()
+
+        if self._cancel_event.is_set():
+            _status("Cancelled")
+            run_dir.write_timeline(log)
+            return False
 
         if not build_ok.get("ble"):
             _status("BLE build FAILED")
             log.log("BLE build FAILED — aborting")
             run_dir.write_timeline(log)
-            return
+            return False
         if not build_ok.get("sensor"):
             _status("Sensor build FAILED")
             log.log("Sensor build FAILED — aborting")
             run_dir.write_timeline(log)
-            return
+            return False
 
-        # Phase 2: Flash
-        import re as _re
+        # Phase 2: Flash sensor + BLE in parallel (SNR_SENSOR vs SNR_HUB — different programmers)
         gatt_mode = ble_mode in ("gatt", "lesc", "gatt_oscore")
 
-        if rebuild_sensor:
-            _status("flashing sensor…")
-            if not _stream_flash("sensor"):
-                _status("Sensor flash FAILED")
-                run_dir.write_timeline(log)
-                return
+        _status("flashing sensor + BLE…")
+        _flash_ok: dict[str, bool] = {}
 
-        _status("flashing BLE…")
-        if not _stream_flash("ble"):
+        def _do_flash_sensor_parallel():
+            if rebuild_sensor or use_prebuild_sensor:
+                log.log(_MS.SENSOR_FLASH_STARTED)
+                if use_prebuild_sensor:
+                    ok = _stream_flash_from_dir(
+                        "sensor", prebuild_session.sensor_dirs[ble_mode])
+                else:
+                    ok = _stream_flash("sensor")
+                _flash_ok["sensor"] = ok
+                if ok:
+                    log.log(_MS.SENSOR_FLASHED)
+            else:
+                _flash_ok["sensor"] = True
+
+        def _do_flash_ble_parallel():
+            log.log(_MS.BLE_FLASH_STARTED)
+            if use_prebuild_ble:
+                ok = _stream_flash_from_dir(
+                    "ble",
+                    prebuild_session.ble_dirs[_rt._ble_variant_key(ble_mode, coap_mode)],
+                )
+            else:
+                ok = _stream_flash("ble")
+            _flash_ok["ble"] = ok
+            if ok:
+                log.log(_MS.BLE_FLASHED)
+
+        _ts = threading.Thread(target=_do_flash_sensor_parallel, daemon=True)
+        _tb = threading.Thread(target=_do_flash_ble_parallel,    daemon=True)
+        _ts.start(); _tb.start()
+        _ts.join();  _tb.join()
+
+        if not _flash_ok.get("sensor", True):
+            _status("Sensor flash FAILED")
+            run_dir.write_timeline(log)
+            return False
+        if not _flash_ok.get("ble"):
             _status("BLE flash FAILED")
             run_dir.write_timeline(log)
-            return
+            return False
+
+        if self._cancel_event.is_set():
+            _status("Cancelled")
+            run_dir.write_timeline(log)
+            return False
 
         _rt._print_ble_ready(ble_mode, coap_mode, log)
         self._emit_event(f"BLE flashed ({ble_mode} / {coap_mode})")
@@ -828,7 +1087,7 @@ class LogViewer(tk.Tk):
         # arriving before a later wait is reached are not missed.
         import re as _re
         _ev_ble = self._register_log_watcher(
-            "BLE", _re.compile(r"BLE scan active|BLE scan started"))
+            "BLE", _re.compile(r"BLE scan starting|BLE scan active|BLE scan started|Scanning for sensor"))
         _ev_lte = self._register_log_watcher(
             "LTE", _re.compile(r"Connected to Cloud|Custom CoAP connection successful"))
         _ev_sensor = self._register_log_watcher(
@@ -861,6 +1120,7 @@ class LogViewer(tk.Tk):
             log.log("Waiting for sensor BLE connection (up to 60 s)…")
             sensor_conn = self._finish_log_watcher(_ev_sensor, 60)
             if sensor_conn:
+                log.log(_MS.BLE_SENSOR_CONNECTED)
                 log.log("Sensor: hub connected")
                 self._emit_event("Sensor: hub connected")
             else:
@@ -874,21 +1134,44 @@ class LogViewer(tk.Tk):
             "\n".join(f"{k}={v}" for k, v in sorted(env.items())), encoding="utf-8"
         )
 
-        # Phase 4: Trigger location + sampling
-        # Watch LTE logs directly — faster than SSH polling, no case-sensitivity issues.
-        #   env_seen:      OSCORE modes: "OSCORE relay.*queued" (hub relays raw encrypted bytes)
-        #                  plain modes:  "BLE env"              (hub decodes and logs env values)
-        #   location_seen: "location: Wi-Fi" → location module started WiFi scan
-        #   coap_ok:       "CoAP response"   → server acknowledged at least one payload (2.04)
-        env_pat = r"OSCORE relay.*forwarded to server" if ble_mode in _OSCORE_BLE_MODES else r"BLE env\b"
-        _ev_env      = self._register_log_watcher("LTE", env_pat)
-        _ev_location = self._register_log_watcher("LTE", r"location: Wi-Fi")
-        _ev_coap_ok  = self._register_log_watcher("LTE", r"CoAP response")
+        # Phase 4a: Location — send first, wait for fix, wait for its own ACK.
+        # Registering _ev_location_coap before sending ensures we don't miss a fast response.
+        _ev_location      = self._register_log_watcher("LTE", r"location: Wi-Fi")
+        _ev_location_coap = self._register_log_watcher("LTE", r"CoAP response")
 
         _status("triggering location search…")
         log.log("BLE: sending att_location search → nRF9151 IPC")
         self._write_queues["BLE"].put(b"att_location search\r\n")
         self._emit_event("BLE: att_location search sent")
+
+        _status("waiting: LTE location fix…")
+        location_seen = self._finish_log_watcher(_ev_location, 60)
+        if location_seen:
+            log.log(_MS.LTE_LOCATION_SEARCH_STARTED)
+            log.log(_MS.LTE_LOCATION_FIX_WIFI)
+            log.log("LTE: location fix seen (Wi-Fi) ✓")
+            self._emit_event("LTE: location fix active")
+        else:
+            log.log("WARNING: location fix not seen in LTE within 60 s")
+            self._emit_event("WARNING: location timeout")
+
+        _status("waiting: LTE location CoAP ACK…")
+        location_coap_ok = self._finish_log_watcher(_ev_location_coap, 30)
+        if location_coap_ok:
+            log.log(_MS.LTE_LOCATION_ACK_RECEIVED)
+            log.log("LTE: Location CoAP ACK received ✓")
+            self._emit_event("LTE: location CoAP ACK")
+        else:
+            log.log("WARNING: no location CoAP ACK seen in LTE within 30 s")
+            self._emit_event("WARNING: location CoAP ACK timeout")
+
+        # Phase 4b: Sensor data — after location is confirmed, trigger sample + wait for its ACK.
+        # Registering both watchers before sending avoids missing fast events.
+        # For OSCORE relay modes the hub logs "[LTE] OSCORE relay ACK" rather than "CoAP response".
+        env_pat  = r"OSCORE relay.*forwarded to server" if ble_mode in _OSCORE_BLE_MODES else r"BLE env\b"
+        coap_pat = r"OSCORE relay ACK" if ble_mode in _OSCORE_BLE_MODES else r"CoAP response"
+        _ev_env     = self._register_log_watcher("LTE", env_pat)
+        _ev_coap_ok = self._register_log_watcher("LTE", coap_pat)
 
         _status("triggering att_sample…")
         log.log("Sensor: sending att_sample via logviewer write queue")
@@ -897,25 +1180,21 @@ class LogViewer(tk.Tk):
         _status("waiting: LTE received Thingy53 data…")
         env_seen = self._finish_log_watcher(_ev_env, 30)
         if env_seen:
+            # For OSCORE relay the firmware log differs from LTE_SAMPLE_RECEIVED constant;
+            # log it explicitly so _append() UART forwarding isn't relied upon for this path.
+            if ble_mode in _OSCORE_BLE_MODES:
+                log.log(_MS.LTE_SAMPLE_RECEIVED)
             log.log("LTE: Thingy53 env data received ✓")
             self._emit_event("LTE: Thingy53 env received")
         else:
             log.log("WARNING: Thingy53 env not seen at LTE within 30 s")
             self._emit_event("WARNING: env timeout")
 
-        _status("waiting: LTE location search active…")
-        location_seen = self._finish_log_watcher(_ev_location, 30)
-        if location_seen:
-            log.log("LTE: location search started (Wi-Fi) ✓")
-            self._emit_event("LTE: location search active")
-        else:
-            log.log("WARNING: location search not seen in LTE within 30 s")
-            self._emit_event("WARNING: location timeout")
-
         _status("waiting: LTE CoAP response from server…")
         coap_ok = self._finish_log_watcher(_ev_coap_ok, 60)
         if coap_ok:
-            log.log("LTE: CoAP response received (server acknowledged payload) ✓")
+            log.log(_MS.LTE_ACK_RECEIVED)
+            log.log("LTE: CoAP response received (server acknowledged sensor payload) ✓")
             self._emit_event("LTE: CoAP response OK")
         else:
             log.log("WARNING: no CoAP response seen in LTE within 60 s")
@@ -930,45 +1209,65 @@ class LogViewer(tk.Tk):
         server_log = r.stdout.strip()
         run_dir.log_path("server.txt").write_text(server_log, encoding="utf-8")
 
-        # Server-side backstop: ReplayErrorWithEcho means server rejected the
-        # OSCORE payload even though the hub got 2.04 for the outer JSON batch.
-        if ble_mode in _OSCORE_BLE_MODES and "ReplayErrorWithEcho" in server_log:
-            log.log("WARNING: Server rejected OSCORE payload (ReplayErrorWithEcho) — sensor data not stored")
+        # Surface server-side errors from the captured log.
+        if "ReplayErrorWithEcho" in server_log:
+            log.log(f"{_MS.T_FAIL_REASON} server rejected OSCORE payload (ReplayErrorWithEcho) — sensor data not stored")
+            log.log(_MS.SERVER_ERROR_OSCORE_REPLAY)
             self._emit_event("WARNING: OSCORE replay rejected by server")
             env_seen = False
+        if "[Server] ERROR: OSCORE decryption failed" in server_log:
+            log.log(f"{_MS.T_FAIL_REASON} server OSCORE decryption failed (check context keys / replay counter)")
+            log.log(_MS.SERVER_ERROR_OSCORE_DECRYPT)
+            self._emit_event("WARNING: server OSCORE decryption failed")
+            coap_ok = False
+        if "[Server] ERROR: CoAP error" in server_log:
+            # Extract the first occurrence for the reason string
+            for _line in server_log.splitlines():
+                if "[Server] ERROR: CoAP error" in _line:
+                    log.log(f"{_MS.T_FAIL_REASON} server returned CoAP error: {_line.strip()}")
+                    break
+            coap_ok = False
 
         # Determine pass/fail from event watchers
         if wrong_flags:
             passed = True
             log.log("MANUAL CHECK — negative test: verify server logs show expected failure")
         else:
-            passed = env_seen and location_seen and coap_ok
-
-        _rt._save_state({
-            "last_ble":         ble_mode,
-            "last_coap":        coap_mode,
-            "sensor_conf_hash": _rt._conf_hash(_SENS_APP / "security.conf"),
-            "ble_conf_hash":    _rt._conf_hash(_BLE_APP  / "security.conf"),
-        })
+            passed = env_seen and location_seen and location_coap_ok and coap_ok
+            if not passed:
+                if not location_seen:
+                    log.log(f"{_MS.T_FAIL_REASON} location fix timeout (no Wi-Fi fix seen at LTE within 60 s)")
+                if not location_coap_ok:
+                    log.log(f"{_MS.T_FAIL_REASON} location CoAP ACK timeout (server did not ACK location POST within 30 s)")
+                if not env_seen:
+                    log.log(f"{_MS.T_FAIL_REASON} sensor data timeout (env data not seen at LTE hub within 30 s)")
+                if not coap_ok:
+                    log.log(f"{_MS.T_FAIL_REASON} sensor CoAP ACK timeout (server did not ACK sensor POST within 60 s — possible OSCORE replay/context issue)")
 
         status_str = "✓ PASS" if passed else "✗ FAIL"
-        log.log(f"{status_str}  ({label})")
+        log.log(f"{_MS.T_PASS if passed else _MS.T_FAIL} {label}")
         self._emit_event(f"Test {status_str}: {label}")
 
+        elapsed_seconds = round(time.time() - t_start, 1)
         run_dir.write_info({
             "timestamp":       datetime.now().isoformat(timespec="seconds"),
             "ble_mode":        ble_mode,
             "coap_mode":       coap_mode,
             "wrong_flags":     list(wrong_flags),
             "result":          "PASS" if passed else "FAIL",
-            "elapsed_seconds": round(time.time() - t_start, 1),
+            "elapsed_seconds": elapsed_seconds,
             "rebuild_sensor":  rebuild_sensor,
         })
         run_dir.write_timeline(log)
+        self._live_log = None
+        log.close()
 
         # Save UART panel logs (BLE, LTE, Thingy53) so the test run is self-contained.
+        # Slice from the offset recorded at test start so we only include lines
+        # from this test, not stale lines from previous runs still in the buffer.
         for src in ("BLE", "LTE", "Thingy53"):
-            lines = self._all_lines.get(src, [])
+            offset = log_offsets.get(src, 0)
+            lines  = self._all_lines.get(src, [])[offset:]
             text = "".join(
                 f"{wall}  {msg}\n" for wall, msg, kind in lines if kind != "build"
             )
@@ -976,15 +1275,92 @@ class LogViewer(tk.Tk):
                 text, encoding="utf-8"
             )
 
+        # For single-test runs, write suite_summary.json directly.
+        # Suite runs have this written by _run_suite_thread after all scenarios finish.
+        import json as _json
+        if suite_path is not None and write_suite_summary:
+            suffix = ("_" + "_".join(sorted(wrong_flags))) if wrong_flags else ""
+            suite_path.joinpath("suite_summary.json").write_text(
+                _json.dumps({
+                    "timestamp":       datetime.now().isoformat(timespec="seconds"),
+                    "suite_name":      "single",
+                    "total":           1,
+                    "passed":          1 if passed else 0,
+                    "failed":          0 if passed else 1,
+                    "elapsed_seconds": elapsed_seconds,
+                    "scenarios": [{
+                        "index":           1,
+                        "ble":             ble_mode,
+                        "coap":            coap_mode,
+                        "result":          "PASS" if passed else "FAIL",
+                        "elapsed_seconds": elapsed_seconds,
+                        "dir":             f"01_b-{ble_mode}_c-{coap_mode}{suffix}",
+                    }],
+                }, indent=2),
+                encoding="utf-8",
+            )
+
         _status(f"{status_str}  ({label})")
-        time.sleep(3)
+        if not self._cancel_event.is_set():
+            time.sleep(1)
         return passed
 
-    def _run_suite(self):
-        """Load test_suite.json from the same directory and run all non-skipped scenarios."""
+    # ── Prebuild helpers ─────────────────────────────────────────────────────
+
+    def _refresh_prebuild_status(self):
+        """Check filesystem for existing prebuild artifacts and update the label."""
+        import json, sys as _sys
+        _root = Path(__file__).parent.parent.resolve()
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        try:
+            import runtest as _rt
+            suite_path = Path(__file__).parent / "test_suite.json"
+            if not suite_path.exists() or not self._prebuild_status_lbl:
+                return
+            with open(suite_path) as f:
+                suite = json.load(f)
+            scenarios = [s for s in suite.get("scenarios", [])
+                         if not s.get("skip", False) and not s.get("rotate")]
+            seen_sensor: set[str] = set()
+            seen_ble:   set[str] = set()
+            ready = 0
+            total = 0
+            for s in scenarios:
+                ble, coap = s["ble"], s["coap"]
+                sk = ble
+                if sk not in seen_sensor:
+                    seen_sensor.add(sk)
+                    total += 1
+                    if _rt._prebuild_artifact_ready(_rt._sensor_prebuild_dir(ble)):
+                        ready += 1
+                bk = _rt._ble_variant_key(ble, coap)
+                if bk not in seen_ble:
+                    seen_ble.add(bk)
+                    total += 1
+                    if _rt._prebuild_artifact_ready(_rt._ble_prebuild_dir(ble, coap)):
+                        ready += 1
+            if total == 0:
+                text, color = "", PALETTE["MUTE"]
+            elif ready == total:
+                text, color = f"({ready}/{total} ✓)", PALETTE["GRN"]
+            else:
+                text, color = f"({ready}/{total})", PALETTE["MUTE"]
+            self._prebuild_status_lbl.config(text=text, fg=color)
+        except Exception:
+            pass
+
+    def _prebuild_then_suite(self):
+        """Build ALL variants in parallel, wait for completion, refresh all nodes,
+        clear logs, then run the suite using prebuilt artifacts (no per-scenario rebuild)."""
         if self._test_running:
             return
-        import json
+        import json, sys as _sys
+        _root = Path(__file__).parent.parent.resolve()
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        import runtest as _rt
+
         suite_path = Path(__file__).parent / "test_suite.json"
         if not suite_path.exists():
             self._test_status_lbl.config(text="test_suite.json not found")
@@ -995,37 +1371,316 @@ class LogViewer(tk.Tk):
         if not scenarios:
             self._test_status_lbl.config(text="no scenarios to run")
             return
+
+        self._cancel_event.clear()
         self._test_running = True
         self._test_run_btn.config(state=tk.DISABLED)
-        self._suite_run_btn.config(state=tk.DISABLED, text="● Suite…")
+        self._suite_run_btn.config(state=tk.DISABLED)
+        self._smoke_run_btn.config(state=tk.DISABLED)
+        self._prebuilt_run_btn.config(state=tk.DISABLED)
+        self._prebuild_btn.config(state=tk.DISABLED, text="⚙ Building…")
+        self._build_suite_btn.config(state=tk.DISABLED, text="⚙▶ Building…")
+        self._cancel_btn.config(state=tk.NORMAL)
+        self._prebuild_status_lbl.config(text="building…", fg=PALETTE["MUTE"])
+        self._test_status_lbl.config(text="building…", fg=PALETTE["MUTE"])
+
+        pb_suite_name = suite.get("name", "Suite")
+        folder_path, live_path = self._make_suite_folder(pb_suite_name, len(scenarios))
+        self._launch_milestone_window(live_path)
+
+        def _build_then_run():
+            import runtest as _rt2
+            log = _rt2.EventLog(live_path=live_path)
+            self._emit_event(f"Build+Suite: {pb_suite_name} ({len(scenarios)} scenarios)")
+
+            def on_progress(kind: str, key: str, status: str):
+                self.after(0, self._refresh_prebuild_status)
+
+            session = _rt2.prebuild_all(scenarios, log, on_progress=on_progress)
+            self._prebuild_session = session
+
+            # Wait for ALL builds to finish before touching hardware
+            for ev in session.sensor_events.values():
+                ev.wait()
+            for ev in session.ble_events.values():
+                ev.wait()
+
+            failed = (sum(1 for s in session.sensor_status.values() if s == "failed") +
+                      sum(1 for s in session.ble_status.values()    if s == "failed"))
+            if failed:
+                log.log(f"Build+Suite: {failed} build(s) FAILED — aborting suite")
+                self.after(0, lambda: self._test_status_lbl.config(
+                    text=f"{failed} build(s) FAILED", fg=PALETTE["RED"]))
+                self._test_running = False
+                self.after(0, lambda: (
+                    self._test_run_btn.config(state=tk.NORMAL),
+                    self._suite_run_btn.config(state=tk.NORMAL),
+                    self._smoke_run_btn.config(state=tk.NORMAL),
+                    self._prebuilt_run_btn.config(state=tk.NORMAL),
+                    self._prebuild_btn.config(state=tk.NORMAL, text="⚙ Prebuild"),
+                    self._build_suite_btn.config(state=tk.NORMAL, text="⚙▶ Build+Suite"),
+                    self._cancel_btn.config(state=tk.DISABLED),
+                ))
+                self.after(0, self._refresh_prebuild_status)
+                return
+
+            log.log("All builds complete — resetting all nodes…")
+            self.after(0, lambda: (
+                self._build_suite_btn.config(text="⚙▶ Resetting…"),
+                self._test_status_lbl.config(text="resetting nodes…", fg=PALETTE["MUTE"]),
+            ))
+
+            # Reset 91X via BLE shell, reset Thingy:53 via nrfutil
+            self._resetting_sources.update(["BLE", "LTE", "Thingy53"])
+            if self._write_queues.get("BLE"):
+                self._write_queues["BLE"].put(b"reset all\r\n")
+            subprocess.run(
+                ["nrfutil", "device", "reset", "--serial-number", SNR_SENSOR],
+                capture_output=True, text=True,
+            )
+
+            # Wait for nodes to reboot
+            log.log("Waiting 30 s for all nodes to reboot…")
+            self.after(0, lambda: self._test_status_lbl.config(
+                text="waiting for reboot…", fg=PALETTE["MUTE"]))
+            if self._cancel_event.wait(30):
+                self._test_running = False
+                self.after(0, lambda: (
+                    self._test_run_btn.config(state=tk.NORMAL),
+                    self._suite_run_btn.config(state=tk.NORMAL),
+                    self._smoke_run_btn.config(state=tk.NORMAL),
+                    self._prebuilt_run_btn.config(state=tk.NORMAL),
+                    self._prebuild_btn.config(state=tk.NORMAL, text="⚙ Prebuild"),
+                    self._build_suite_btn.config(state=tk.NORMAL, text="⚙▶ Build+Suite"),
+                    self._cancel_btn.config(state=tk.DISABLED),
+                    self._test_status_lbl.config(text="Cancelled", fg=PALETTE["MUTE"]),
+                ))
+                return
+
+            # Clear all log panels before the suite starts
+            log.log("Clearing log panels…")
+            self.after(0, self._clear_all)
+
+            self.after(0, lambda: (
+                self._build_suite_btn.config(text="⚙▶ Running…"),
+                self._test_status_lbl.config(text="starting suite…", fg=PALETTE["MUTE"]),
+            ))
+            self._run_suite_thread(scenarios, pb_suite_name, self._build_suite_btn,
+                                   folder_path, live_path)
+
+        threading.Thread(target=_build_then_run, daemon=True).start()
+
+    def _run_prebuilt_suite(self):
+        """Run the full suite using existing prebuilt artifacts — no rebuild, flash-only.
+        Requires ⚙ Prebuild to have completed successfully first."""
+        if self._test_running:
+            return
+        import json, sys as _sys
+        _root = Path(__file__).parent.parent.resolve()
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        import runtest as _rt
+
+        suite_path = Path(__file__).parent / "test_suite.json"
+        if not suite_path.exists():
+            self._test_status_lbl.config(text="test_suite.json not found")
+            return
+        with open(suite_path) as f:
+            suite = json.load(f)
+        scenarios = [s for s in suite.get("scenarios", []) if not s.get("skip", False)]
+        if not scenarios:
+            self._test_status_lbl.config(text="no scenarios to run")
+            return
+
+        # Verify all prebuilt artifacts exist on disk; build a session from them
+        missing = []
+        for s in scenarios:
+            ble, coap = s["ble"], s["coap"]
+            if not _rt._prebuild_artifact_ready(_rt._sensor_prebuild_dir(ble)):
+                missing.append(f"sensor/{ble}")
+            if not _rt._prebuild_artifact_ready(_rt._ble_prebuild_dir(ble, coap)):
+                missing.append(f"ble/{_rt._ble_variant_key(ble, coap)}")
+        if missing:
+            self._test_status_lbl.config(
+                text=f"missing prebuilts: {', '.join(missing[:3])}{'…' if len(missing) > 3 else ''}",
+                fg=PALETTE["RED"],
+            )
+            self._emit_event(f"▶ Prebuilt: missing {len(missing)} artifact(s) — run ⚙ Prebuild first")
+            return
+
+        # Reconstruct (or reuse) a PrebuildSession with all statuses marked done
+        if self._prebuild_session is None:
+            session = _rt.prebuild_all([], _rt.EventLog())   # empty session skeleton
+            self._prebuild_session = session
+        session = self._prebuild_session
+        for s in scenarios:
+            ble, coap = s["ble"], s["coap"]
+            bk = _rt._ble_variant_key(ble, coap)
+            session.sensor_status[ble]  = "done"
+            session.sensor_dirs[ble]    = _rt._sensor_prebuild_dir(ble)
+            import threading as _th
+            if ble not in session.sensor_events:
+                ev = _th.Event(); ev.set(); session.sensor_events[ble] = ev
+            session.ble_status[bk]  = "done"
+            session.ble_dirs[bk]    = _rt._ble_prebuild_dir(ble, coap)
+            if bk not in session.ble_events:
+                ev = _th.Event(); ev.set(); session.ble_events[bk] = ev
+
+        suite_name = suite.get("name", "Suite (prebuilt)")
+        folder_path, live_path = self._make_suite_folder(suite_name, len(scenarios))
+        self._launch_milestone_window(live_path)
+
+        self._cancel_event.clear()
+        self._test_running = True
+        self._test_run_btn.config(state=tk.DISABLED)
+        self._suite_run_btn.config(state=tk.DISABLED)
+        self._smoke_run_btn.config(state=tk.DISABLED)
+        self._prebuilt_run_btn.config(state=tk.DISABLED, text="● Prebuilt…")
+        self._prebuild_btn.config(state=tk.DISABLED)
+        self._build_suite_btn.config(state=tk.DISABLED)
+        self._cancel_btn.config(state=tk.NORMAL)
+        self._emit_event(f"▶ Prebuilt Suite: {suite_name} ({len(scenarios)} scenarios)")
         threading.Thread(
             target=self._run_suite_thread,
-            args=(scenarios, suite.get("name", "Suite")),
+            args=(scenarios, suite_name, self._prebuilt_run_btn, folder_path, live_path),
             daemon=True,
         ).start()
 
-    def _run_suite_thread(self, scenarios: list, suite_name: str):
+    def _prebuild_suite(self):
+        """Load test_suite.json and spawn parallel prebuild threads for all unique variants."""
+        import json
+        suite_path = Path(__file__).parent / "test_suite.json"
+        if not suite_path.exists():
+            self._test_status_lbl.config(text="test_suite.json not found")
+            return
+        with open(suite_path) as f:
+            suite = json.load(f)
+        scenarios = [s for s in suite.get("scenarios", []) if not s.get("skip", False)]
+        if not scenarios:
+            self._test_status_lbl.config(text="no scenarios to prebuild")
+            return
+        self._prebuild_session = None
+        self._prebuild_btn.config(state=tk.DISABLED, text="⚙ Building…")
+        self._test_status_lbl.config(text="prebuild started…", fg=PALETTE["MUTE"])
+        self._emit_event("Prebuild started")
+        threading.Thread(target=self._prebuild_suite_thread, args=(scenarios,), daemon=True).start()
+
+    def _prebuild_suite_thread(self, scenarios: list):
         import sys as _sys
-        _here = Path(__file__).parent.resolve()
-        if str(_here) not in _sys.path:
-            _sys.path.insert(0, str(_here))
+        _root = Path(__file__).parent.parent.resolve()  # tracker-utils/
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        import runtest as _rt
+
+        log        = _rt.EventLog()
+        done_count = [0]
+        session    = None  # assigned after prebuild_all() returns; guard below
+
+        def on_progress(kind: str, key: str, status: str):
+            if status in ("done", "failed"):
+                done_count[0] += 1
+            if session is None:
+                return
+            total = len(session.sensor_events) + len(session.ble_events)
+            color = PALETTE["GRN"] if status == "done" else (
+                    PALETTE["RED"] if status == "failed" else PALETTE["MUTE"])
+            self._emit_event(f"Prebuild {kind} {key}: {status}")
+            self.after(0, lambda c=color, d=done_count[0], t=total:
+                self._test_status_lbl.config(
+                    text=f"prebuild {d}/{t}", fg=c if d == t else PALETTE["MUTE"]))
+
+        session = _rt.prebuild_all(scenarios, log, on_progress=on_progress)
+        self._prebuild_session = session
+
+        for ev in session.sensor_events.values():
+            ev.wait()
+        for ev in session.ble_events.values():
+            ev.wait()
+
+        failed  = (sum(1 for s in session.sensor_status.values() if s == "failed") +
+                   sum(1 for s in session.ble_status.values()    if s == "failed"))
+        total   = len(session.sensor_events) + len(session.ble_events)
+        summary = f"prebuild {total - failed}/{total} OK"
+        color   = PALETTE["GRN"] if failed == 0 else PALETTE["RED"]
+        self._emit_event(f"Prebuild complete: {summary}")
+        self.after(0, lambda: (
+            self._prebuild_btn.config(state=tk.NORMAL, text="⚙ Prebuild"),
+            self._test_status_lbl.config(text=summary, fg=color),
+        ))
+        self.after(0, self._refresh_prebuild_status)
+
+    def _run_suite(self, suite_file: str = "test_suite.json"):
+        """Load suite_file from the same directory and run all non-skipped scenarios."""
+        if self._test_running:
+            return
+        import json
+        suite_path = Path(__file__).parent / suite_file
+        if not suite_path.exists():
+            self._test_status_lbl.config(text=f"{suite_file} not found")
+            return
+        with open(suite_path) as f:
+            suite = json.load(f)
+        scenarios = [s for s in suite.get("scenarios", []) if not s.get("skip", False)]
+        if not scenarios:
+            self._test_status_lbl.config(text="no scenarios to run")
+            return
+        suite_name = suite.get("name", Path(suite_file).stem)
+        folder_path, live_path = self._make_suite_folder(suite_name, len(scenarios))
+        self._launch_milestone_window(live_path)
+
+        self._cancel_event.clear()
+        self._test_running = True
+        active_btn = (self._smoke_run_btn
+                      if suite_file == "test_suite_smoke.json"
+                      else self._suite_run_btn)
+        self._test_run_btn.config(state=tk.DISABLED)
+        self._suite_run_btn.config(state=tk.DISABLED, text="▶ Suite" if active_btn is not self._suite_run_btn else "● Suite…")
+        self._smoke_run_btn.config(state=tk.DISABLED, text="▶ Smoke" if active_btn is not self._smoke_run_btn else "● Smoke…")
+        self._prebuilt_run_btn.config(state=tk.DISABLED)
+        self._build_suite_btn.config(state=tk.DISABLED)
+        self._cancel_btn.config(state=tk.NORMAL)
+        threading.Thread(
+            target=self._run_suite_thread,
+            args=(scenarios, suite_name, active_btn, folder_path, live_path),
+            daemon=True,
+        ).start()
+
+    def _run_smoke(self):
+        self._run_suite("test_suite_smoke.json")
+
+    def _run_suite_thread(self, scenarios: list, suite_name: str, active_btn: tk.Button,
+                          suite_path: Path | None = None, live_path: Path | None = None):
+        import sys as _sys, json as _json, time as _time
+        _root = Path(__file__).parent.parent.resolve()  # tracker-utils/
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
         import runtest as _rt
 
         total        = len(scenarios)
         passed_count = 0
+        suite_results: list[dict] = []
+        suite_t0     = _time.time()
         self._emit_event(f"Suite started: {suite_name} ({total} scenarios)")
 
+        cancelled = False
+        i = 0
         for i, s in enumerate(scenarios):
+            if self._cancel_event.is_set():
+                self._emit_event(f"[Test] Suite cancelled — {passed_count}/{i} passed so far")
+                cancelled = True
+                break
+
             ble     = s["ble"]
             coap    = s["coap"]
             wrong   = frozenset(s.get("wrong",  []))
             rotate  = s.get("rotate", [])
             comment = s.get("comment", "")
             label   = f"{ble} + {coap}" + (f"  ({comment})" if comment else "")
+            sc_idx  = i + 1
 
-            self._emit_event(f"Suite {i + 1}/{total}: {label}")
-            self.after(0, lambda n=i + 1, t=total:
-                self._suite_run_btn.config(text=f"● {n}/{t}"))
+            self._emit_event(f"Suite {sc_idx}/{total}: {label}")
+            self.after(0, lambda n=sc_idx, t=total, b=active_btn:
+                b.config(text=f"● {n}/{t}"))
 
             # Key rotation before the test, if requested
             if "dtls" in rotate:
@@ -1038,22 +1693,66 @@ class LogViewer(tk.Tk):
             if oscore_targets:
                 _rt._rotate_oscore_keys(oscore_targets, _rt.EventLog())
 
+            sc_t0 = _time.time()
             try:
-                passed = self._run_test_thread(ble, coap, wrong)
+                passed = self._run_test_thread(ble, coap, wrong,
+                                               prebuild_session=self._prebuild_session,
+                                               suite_path=suite_path,
+                                               live_path=live_path,
+                                               idx=sc_idx,
+                                               total=total)
                 if passed:
                     passed_count += 1
             except Exception as e:
+                passed = False
                 self._emit_event(f"Suite ERROR in {label}: {e}")
 
-        summary = f"{passed_count}/{total} PASSED"
-        self._emit_event(f"Suite complete: {suite_name} — {summary}")
-        color = "#4caf50" if passed_count == total else "#f44336"
+            sc_elapsed = round(_time.time() - sc_t0, 1)
+            suffix = ("_" + "_".join(sorted(wrong))) if wrong else ""
+            suite_results.append({
+                "index":           sc_idx,
+                "ble":             ble,
+                "coap":            coap,
+                "result":          "PASS" if passed else "FAIL",
+                "elapsed_seconds": sc_elapsed,
+                "dir":             f"{sc_idx:02d}_b-{ble}_c-{coap}{suffix}",
+            })
+
+        if suite_path is not None:
+            try:
+                suite_path.joinpath("suite_summary.json").write_text(
+                    _json.dumps({
+                        "timestamp":       __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+                        "suite_name":      suite_name,
+                        "total":           total,
+                        "passed":          passed_count,
+                        "failed":          len(suite_results) - passed_count,
+                        "elapsed_seconds": round(_time.time() - suite_t0, 1),
+                        "scenarios":       suite_results,
+                    }, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+        if cancelled:
+            summary = f"Cancelled — {passed_count}/{i} passed"
+        else:
+            summary = f"{passed_count}/{total} PASSED"
+            self._emit_event(f"Suite complete: {suite_name} — {summary}")
+        color = "#4caf50" if (not cancelled and passed_count == total) else "#f44336"
         self._test_running = False
         self.after(0, lambda: (
             self._test_run_btn.config(state=tk.NORMAL),
             self._suite_run_btn.config(state=tk.NORMAL, text="▶ Suite"),
+            self._smoke_run_btn.config(state=tk.NORMAL, text="▶ Smoke"),
+            self._prebuilt_run_btn.config(state=tk.NORMAL, text="▶ Prebuilt"),
+            self._build_suite_btn.config(state=tk.NORMAL, text="⚙▶ Build+Suite"),
+            self._prebuild_btn.config(state=tk.NORMAL, text="⚙ Prebuild"),
+            self._cancel_btn.config(state=tk.DISABLED),
             self._test_status_lbl.config(text=summary, fg=color),
         ))
+        self.after(0, self._refresh_prebuild_status)
 
     def _switch_tab(self, source: str, tab: str):
         self._active_tab[source] = tab
@@ -1184,8 +1883,8 @@ class LogViewer(tk.Tk):
     def _on_ble_mode_changed(self, *_):
         ble = self._ble_mode_var.get()
         oscore_ble = ble in _OSCORE_BLE_MODES
-        if (self._coap_mode_var.get() in _OSCORE_COAP_MODES) != oscore_ble:
-            self._coap_mode_var.set("dtls_oscore" if oscore_ble else "dtls")
+        if oscore_ble and self._coap_mode_var.get() not in _OSCORE_COAP_MODES:
+            self._coap_mode_var.set("dtls_oscore")
         self._update_mode_indicators()
 
     def _update_mode_indicators(self):

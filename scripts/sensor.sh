@@ -13,16 +13,16 @@
 
 set -euo pipefail
 
-WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SNR="${SNR_SENSOR:-1050065248}"   # nRF52 DK → Thingy:53 SWD pads
 DEVICE="NRF5340_XXAA_APP"
 
 build() {
-    python3 "${WORKSPACE}/tracker-utils/build.py" build sensor ${1:+--pristine}
+    python3 "${WORKSPACE}/tracker-utils/tools/build.py" build sensor ${1:+--pristine}
 }
 
 flash() {
-    python3 "${WORKSPACE}/tracker-utils/build.py" flash sensor
+    python3 "${WORKSPACE}/tracker-utils/tools/build.py" flash sensor
 }
 
 recover() {

@@ -1,0 +1,25 @@
+{
+  "name": "Full scenario matrix (2026-05-28)",
+  "scenarios": [
+    { "ble": "broadcast",       "coap": "none",        "comment": "Broadcast, no CoAP security" },
+    { "ble": "broadcast",       "coap": "oscore",      "comment": "Broadcast + CoAP OSCORE" },
+    { "ble": "broadcast",       "coap": "dtls",        "comment": "Broadcast + DTLS" },
+    { "ble": "broadcast",       "coap": "dtls_oscore", "comment": "Broadcast + DTLS + OSCORE" },
+
+    { "ble": "gatt",            "coap": "none",        "comment": "GATT, no CoAP security" },
+    { "ble": "gatt",            "coap": "oscore",      "comment": "GATT + CoAP OSCORE" },
+    { "ble": "gatt",            "coap": "dtls",        "comment": "GATT + DTLS" },
+    { "ble": "gatt",            "coap": "dtls_oscore", "comment": "GATT + DTLS + OSCORE" },
+
+    { "ble": "lesc",            "coap": "none",        "comment": "LESC, no CoAP security" },
+    { "ble": "lesc",            "coap": "oscore",      "comment": "LESC + CoAP OSCORE" },
+    { "ble": "lesc",            "coap": "dtls",        "comment": "LESC + DTLS" },
+    { "ble": "lesc",            "coap": "dtls_oscore", "comment": "LESC + DTLS + OSCORE" },
+
+    { "ble": "gatt_oscore",     "coap": "oscore",      "comment": "GATT BLE OSCORE E2E" },
+    { "ble": "gatt_oscore",     "coap": "dtls_oscore", "comment": "GATT BLE OSCORE E2E + DTLS (thesis target)" },
+
+    { "ble": "broadcast_oscore","coap": "oscore",      "comment": "Broadcast BLE OSCORE E2E" },
+    { "ble": "broadcast_oscore","coap": "dtls_oscore", "comment": "Broadcast BLE OSCORE E2E + DTLS" }
+  ]
+}

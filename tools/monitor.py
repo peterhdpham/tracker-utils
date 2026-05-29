@@ -22,8 +22,9 @@ from pathlib import Path
 import serial
 
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_CORE = _HERE.parent / "core"
+if str(_CORE) not in sys.path:
+    sys.path.insert(0, str(_CORE))
 
 from serial_io import find_thingy91x_ports
 from ui_constants import BAUD

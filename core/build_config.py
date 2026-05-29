@@ -25,8 +25,8 @@ NRFUTIL_WRAP = [
 # This file lives at tracker_project/tracker-utils/build_config.py
 # → parent = tracker_project/
 
-_HERE      = Path(__file__).resolve().parent   # tracker_project/tracker-utils/
-_WORKSPACE = _HERE.parent                      # tracker_project/
+_HERE      = Path(__file__).resolve().parent   # tracker_project/tracker-utils/core/
+_WORKSPACE = _HERE.parent.parent               # tracker_project/
 
 _LTE_APP  = _WORKSPACE / "tracker-hub"         / "apps" / "tracker-hub-lte"
 _BLE_APP  = _WORKSPACE / "tracker-hub"         / "apps" / "tracker-hub-ble"
@@ -85,11 +85,6 @@ TARGETS: dict = {
         # sysbuild forwards image-specific vars — use cmake_image prefix so conf
         # files reach the BLE image (named tracker-hub-ble, matching the app dir).
         "cmake_image": "tracker-hub-ble",
-        # Recover Application core before programming (clears ERASEPROTECT/APPROTECT).
-        "pre_flash_cmds": [
-            ["nrfutil", "device", "recover",
-             "--serial-number", SNR_HUB, "--core", "Application"],
-        ],
         "flash_cmd": [
             "west", "flash",
             "--recover",

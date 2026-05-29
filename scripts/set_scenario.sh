@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 HUB_LTE="${WORKSPACE}/tracker-hub/apps/tracker-hub-lte/local.conf"
 SENSOR="${WORKSPACE}/tracker-sensor-node/tracker-node/local.conf"
